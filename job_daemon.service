@@ -1,0 +1,18 @@
+[Unit]
+Description=QE GUI Job Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/khluise/Downloads/Qe_gui_test
+ExecStart=/usr/bin/env python3 /home/khluise/Downloads/Qe_gui_test/job_daemon.py --queue-file /home/khluise/Downloads/Qe_gui_test/job_queue.json --poll-interval 1.0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+# Notes:
+# - Replace `User=%i` with the target username or remove the `%i` placeholder.
+# - Install with: `sudo cp job_daemon.service /etc/systemd/system/` then `sudo systemctl daemon-reload` and `sudo systemctl enable --now job_daemon.service`

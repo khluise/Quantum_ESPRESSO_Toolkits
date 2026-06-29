@@ -1,0 +1,7 @@
+filelock>=3.12.0
+pyqt6
+seekpath
+ase
+beautifulsoup4
+requests
+scipy>=1.7
