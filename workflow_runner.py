@@ -1028,7 +1028,7 @@ def run_phonon_workflow_child(
                 base_text,
                 prefix=prefix,
                 outdir=outdir,
-                tr2_ph=str(phonon_options.get("epc_tr2_ph") or "1.0d-10"),
+                tr2_ph=str(phonon_options.get("epc_tr2_ph") or phonon_options.get("tr2_ph") or "1.0d-10"),
                 alpha_mix=str(phonon_options.get("alpha_mix") or "0.7"),
                 fildyn=str(phonon_options.get("fildyn") or "phonon.dyn"),
                 ldisp=True,
@@ -3272,7 +3272,7 @@ def write_phonon_projected_combined_plot(
                 )
     if distances:
         ax_band.set_xlim(min(distances), max(distances) if max(distances) > min(distances) else min(distances) + 1.0)
-    ax_band.set_ylabel(r"Frequency (cm$^{-1}$)", fontsize=label_font_size)
+    ax_band.set_ylabel(r"Frequency (cm$^{-1}$)", fontsize=label_font_size, fontweight="bold")
     ax_band.set_xlabel("")
     ax_band.grid(False)
 
@@ -3339,15 +3339,17 @@ def write_phonon_projected_combined_plot(
             )
             legend_labels.append(f"{element} {direction}")
     if legend_handles and show_legend:
-        fig.legend(
+        legend = fig.legend(
             legend_handles,
             legend_labels,
             loc="upper center",
             ncol=int(legend_columns or min(len(legend_handles), 6)),
-            fontsize=legend_font_size,
+            prop={"weight": "bold", "size": legend_font_size},
             frameon=False,
             bbox_to_anchor=tuple(float(value) for value in legend_anchor[:2]),
         )
+        for text in legend.get_texts():
+            text.set_fontweight("bold")
     fig.subplots_adjust(
         left=float(subplot_left),
         right=float(subplot_right),
@@ -7296,6 +7298,17 @@ def _bold_plot_axes(ax: Any) -> None:
         label.set_fontweight("bold")
 
 
+def italic_atom_orbital_legend_label(label: str) -> str:
+    text = str(label)
+    if " - " not in text:
+        return text
+    atom, orbital = text.rsplit(" - ", 1)
+    orbital = orbital.strip()
+    if not orbital:
+        return text
+    return f"{atom} - $\\boldsymbol{{\\mathit{{{orbital}}}}}$"
+
+
 def draw_atomic_orbital_dos_panel(
     ax: Any,
     *,
@@ -7331,7 +7344,7 @@ def draw_atomic_orbital_dos_panel(
     ax.axhline(0.0, color="grey", linestyle="--", linewidth=1.2, alpha=0.7)
     ax.set_xlabel("DOS (states/eV)", fontweight="bold")
     if show_ylabel:
-        ax.set_ylabel(r"$\mathbf{E - E}_{\mathbf{F}}$ (eV)", fontweight="bold")
+        ax.set_ylabel(r"$\boldsymbol{\mathit{E - E}_{\mathit{F}}}$ (eV)", fontweight="bold")
     else:
         ax.set_ylabel("")
         ax.tick_params(labelleft=False)
@@ -7421,8 +7434,8 @@ def write_band_atomic_orbital_dos_side_by_side_plot(
     if band_x_min is not None or band_x_max is not None:
         ax_band.set_xlim(band_x_min, band_x_max)
 
-    ax_band.set_xlabel("k-path", fontweight="bold")
-    ax_band.set_ylabel(r"$\mathbf{E - E}_{\mathbf{F}}$ (eV)", fontweight="bold")
+    ax_band.set_xlabel(r"$\boldsymbol{\mathit{k}}$-path", fontweight="bold")
+    ax_band.set_ylabel(r"$\boldsymbol{\mathit{E - E}_{\mathit{F}}}$ (eV)", fontweight="bold")
     if energy_min is not None or energy_max is not None:
         ax_band.set_ylim(energy_min, energy_max)
     ax_band.grid(False)
@@ -7464,9 +7477,10 @@ def write_band_atomic_orbital_dos_side_by_side_plot(
         axes_top = max(ax_band.get_position().y1, ax_dos.get_position().y1)
         ncol = int(legend_columns) if legend_columns else min(len(labels), 6)
         ncol = max(1, min(ncol, len(labels)))
+        display_labels = [italic_atom_orbital_legend_label(label) for label in labels]
         legend = fig.legend(
             circle_handles,
-            labels,
+            display_labels,
             loc="lower center",
             bbox_to_anchor=(0.5, axes_top + float(legend_y_offset)),
             ncol=ncol,

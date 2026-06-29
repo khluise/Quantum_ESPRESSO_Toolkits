@@ -3402,6 +3402,8 @@ def normalize_phonon_options(options: Mapping[str, Any]) -> dict[str, Any]:
     phdos_flvec = str(raw.get("phdos_flvec") or raw.get("dos_flvec") or "phonon_dos.modes").strip() or "phonon_dos.modes"
     epc_fldos = str(raw.get("epc_fldos") or raw.get("a2f_fldos") or "phonon.dos").strip() or "phonon.dos"
     tr2_ph = str(raw.get("tr2_ph") or "1.0d-12").strip() or "1.0d-12"
+    epc_tr2_ph_raw = str(raw.get("epc_tr2_ph") or "").strip()
+    epc_tr2_ph = epc_tr2_ph_raw or (tr2_ph if str(raw.get("tr2_ph") or "").strip() else "1.0d-10")
     alpha_mix = str(raw.get("alpha_mix") or raw.get("alpha_mix(1)") or "0.7").strip() or "0.7"
     nmix_ph = positive_int(raw, ["nmix_ph"], 4)
     verbosity = str(raw.get("verbosity") or "default").strip() or "default"
@@ -3454,7 +3456,7 @@ def normalize_phonon_options(options: Mapping[str, Any]) -> dict[str, Any]:
         "epc_q_grid": normalize_phonon_nq_grid(raw.get("epc_q_grid", raw.get("epc_nq", raw.get("a2f_q_grid"))), DEFAULT_EPC_Q_GRID),
         "fildvscf": str(raw.get("fildvscf") or "dvscf").strip() or "dvscf",
         "electron_phonon": str(raw.get("electron_phonon") or "interpolated").strip() or "interpolated",
-        "epc_tr2_ph": str(raw.get("epc_tr2_ph") or "1.0d-10").strip() or "1.0d-10",
+        "epc_tr2_ph": epc_tr2_ph,
         "epc_ndos": positive_int(raw, ["epc_ndos", "ndos"], 50),
         "lambda_emax": str(raw.get("lambda_emax") or raw.get("emax") or "auto").strip() or "auto",
         "lambda_degauss": str(raw.get("lambda_degauss") or "0.1").strip() or "0.1",

@@ -11093,6 +11093,7 @@ class MainUI(QMainWindow):
             "epc_scf_kmesh": epc_scf_kmesh,
             "epc_q_grid": epc_q_grid,
             "tr2_ph": tr2_ph,
+            "epc_tr2_ph": tr2_ph,
             "alpha_mix": alpha_mix,
             "fildyn": fildyn,
             "flfrc": flfrc,
