@@ -22,6 +22,7 @@ from typing import Any, Mapping, Sequence
 from analyze_wannier_windows import analyze_windows
 from workflow_builder import (
     _generate_workflow_qe_input,
+    _finalize_prepared_qe_template,
     BANDS_DIR,
     CHARGE_DENSITY_DIR,
     DATA_PLOTS_DIR,
@@ -345,8 +346,10 @@ def run_structure_prepare(manifest: Mapping[str, Any], state: dict[str, Any], st
             )
         elif stored_input.resolve() != prepared_output.resolve():
             shutil.copy2(stored_input, prepared_output)
+            _finalize_prepared_qe_template(prepared_output, conversion_options)
             append_log(child_log_path, f"Prepared QE input copied to {prepared_output}\n")
         else:
+            _finalize_prepared_qe_template(prepared_output, conversion_options)
             append_log(child_log_path, f"Prepared QE input already available at {prepared_output}\n")
 
         child["status"] = "completed"
@@ -643,7 +646,7 @@ def run_phonon_workflow_task(
     spin_orbit = workflow_spin_orbit_enabled(manifest)
     uses_converged = bool(params.get("uses_converged_values", True))
     results = state.get("results") if isinstance(state.get("results"), Mapping) else {}
-    ecutwfc = results.get("ecutwfc") if uses_converged and isinstance(results, Mapping) else None
+    ecutwfc = effective_workflow_ecutwfc(manifest, state, uses_converged_values=uses_converged)
     converged_kmesh: list[int] | None = None
     if uses_converged and use_converged_kmesh and isinstance(results, Mapping):
         mesh = results.get("kmesh")
@@ -3780,7 +3783,7 @@ def run_dos_workflow_task(
     spin_orbit = workflow_spin_orbit_enabled(manifest)
     uses_converged = bool(params.get("uses_converged_values", True))
     results = state.get("results") if isinstance(state.get("results"), Mapping) else {}
-    ecutwfc = results.get("ecutwfc") if uses_converged and isinstance(results, Mapping) else None
+    ecutwfc = effective_workflow_ecutwfc(manifest, state, uses_converged_values=uses_converged)
     converged_kmesh: list[int] | None = None
     if uses_converged and use_converged_kmesh and isinstance(results, Mapping):
         mesh = results.get("kmesh")
@@ -3941,7 +3944,7 @@ def run_wannier90_workflow_task(
     spin_orbit = workflow_spin_orbit_enabled(manifest)
     uses_converged = bool(params.get("uses_converged_values", True))
     results = state.get("results") if isinstance(state.get("results"), Mapping) else {}
-    ecutwfc = results.get("ecutwfc") if uses_converged and isinstance(results, Mapping) else None
+    ecutwfc = effective_workflow_ecutwfc(manifest, state, uses_converged_values=uses_converged)
 
     task["status"] = "running"
     task["running_child"] = None
@@ -5546,7 +5549,7 @@ def run_charge_density_workflow_task(
     spin_orbit = workflow_spin_orbit_enabled(manifest)
     uses_converged = bool(params.get("uses_converged_values", True))
     results = state.get("results") if isinstance(state.get("results"), Mapping) else {}
-    ecutwfc = results.get("ecutwfc") if uses_converged and isinstance(results, Mapping) else None
+    ecutwfc = effective_workflow_ecutwfc(manifest, state, uses_converged_values=uses_converged)
 
     task["status"] = "running"
     task["running_child"] = None
@@ -7700,7 +7703,7 @@ def run_band_workflow_task(
     spin_orbit = workflow_spin_orbit_enabled(manifest)
     uses_converged = bool(params.get("uses_converged_values", True))
     results = state.get("results") if isinstance(state.get("results"), Mapping) else {}
-    ecutwfc = results.get("ecutwfc") if uses_converged and isinstance(results, Mapping) else None
+    ecutwfc = effective_workflow_ecutwfc(manifest, state, uses_converged_values=uses_converged)
 
     task["status"] = "running"
     task["running_child"] = None
@@ -7946,13 +7949,22 @@ def run_band_workflow_child(
         state["updated_at"] = timestamp()
         add_event(state, "child.completed", {"task": task_id, "child": child.get("id"), "stage": stage})
         write_state(state_path, state)
-    except Exception:
+    except Exception as exc:
+        archive_child_files(workflow_root, child)
+        error_message = str(exc)
         child["status"] = "failed"
+        child["error"] = error_message
         task["status"] = "failed"
+        task["error"] = error_message
         task["running_child"] = None
         state["status"] = "failed"
+        state["last_error"] = error_message
         state["updated_at"] = timestamp()
-        add_event(state, "child.failed", {"task": task_id, "child": child.get("id"), "stage": stage})
+        add_event(
+            state,
+            "child.failed",
+            {"task": task_id, "child": child.get("id"), "stage": stage, "error": error_message},
+        )
         write_state(state_path, state)
         raise
 
@@ -8833,7 +8845,11 @@ def run_accuracy_relaxation_task(
         base_text = render_qe_input_with_structure(template_text, structure_data) if structure_data else template_text
 
         results = state.get("results") if isinstance(state.get("results"), Mapping) else {}
-        ecutwfc = results.get("ecutwfc") if uses_converged_values and isinstance(results, Mapping) else None
+        ecutwfc = effective_workflow_ecutwfc(
+            manifest,
+            state,
+            uses_converged_values=uses_converged_values,
+        )
         kmesh = results.get("kmesh") if uses_converged_values and isinstance(results, Mapping) else None
         rendered = render_final_relaxation_input(
             base_text,
@@ -8908,6 +8924,7 @@ def run_accuracy_relaxation_task(
         if not relaxed_structure:
             raise RuntimeError(f"Could not extract relaxed structure for {task_id}.")
         if convergence_summary.get("relaxation_converged") is False:
+            error_message = relaxation_failure_message(task_id, convergence_summary, attempts)
             if task_id == "final_relaxation":
                 record_structure_relaxation_failure(
                     workflow_root,
@@ -8917,10 +8934,57 @@ def run_accuracy_relaxation_task(
                     relaxed_structure,
                     convergence_summary,
                     attempts,
+                    error_message,
                 )
-            raise RuntimeError(
-                f"{task_id} did not fully converge. Both scf_conv and opt_conv convergence_achieved must be true."
+            else:
+                failed_structure_relative = str(Path("data_and_plots") / structure_filename)
+                write_json_file(workflow_root / failed_structure_relative, relaxed_structure)
+                archive_child_files(workflow_root, child)
+                child["status"] = "failed"
+                child["error"] = error_message
+                child["relaxation_converged"] = False
+                child["failure_reason"] = "structure_relaxation_failed"
+                task["status"] = "failed"
+                task["error"] = error_message
+                task["running_child"] = None
+                task["result"] = {
+                    "structure_relaxation_failed": True,
+                    "continued_on_failure": True,
+                    "continued_structure": failed_structure_relative,
+                    "relaxed_structure": failed_structure_relative,
+                    "input": str(Path(str(child.get("input") or "")).as_posix()),
+                    "output": str(Path(str(child.get("output") or "")).as_posix()),
+                    "attempts": attempts,
+                    "error": error_message,
+                    **convergence_summary,
+                }
+                results_state = state.setdefault("results", {})
+                results_state[output_result_key] = child.get("output")
+                results_state[structure_result_key] = failed_structure_relative
+                results_state[f"{task_id}_converged"] = False
+                results_state[f"{task_id}_continued_on_failure"] = True
+            state["updated_at"] = timestamp()
+            add_event(
+                state,
+                "task.failed",
+                {
+                    "task": task_id,
+                    "child": child.get("id"),
+                    "error": error_message,
+                    "continued_on_failure": True,
+                },
             )
+            add_event(
+                state,
+                "task.warning",
+                {
+                    "task": task_id,
+                    "child": child.get("id"),
+                    "message": "Relaxation did not converge; continuing with the latest extracted structure.",
+                },
+            )
+            write_state(state_path, state)
+            return
         if command_result["return_code"] != 0 and convergence_summary.get("relaxation_converged") is not True:
             raise RuntimeError(f"{task_id} command exited with {command_result['return_code']}.")
 
@@ -8982,15 +9046,19 @@ def run_accuracy_relaxation_task(
         add_event(state, "task.completed", {"task": task_id, "child": child.get("id")})
         state["updated_at"] = timestamp()
         write_state(state_path, state)
-    except Exception:
+    except Exception as exc:
+        error_message = str(exc)
         if task_id == "final_relaxation":
             archive_terminal_relaxation_attempt(workflow_root, child)
         child["status"] = "failed"
+        child["error"] = error_message
         task["status"] = "failed"
+        task["error"] = error_message
         task["running_child"] = None
         state["status"] = "failed"
+        state["last_error"] = error_message
         state["updated_at"] = timestamp()
-        add_event(state, "task.failed", {"task": task_id, "child": child.get("id")})
+        add_event(state, "task.failed", {"task": task_id, "child": child.get("id"), "error": error_message})
         write_state(state_path, state)
         raise
 
@@ -9072,6 +9140,22 @@ def relaxation_attempt_summary(attempt: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def relaxation_failure_message(
+    task_id: str,
+    convergence_summary: Mapping[str, Any],
+    attempts: Sequence[Mapping[str, Any]],
+) -> str:
+    scf = convergence_summary.get("scf_converged")
+    opt = convergence_summary.get("optimization_converged")
+    details = [f"scf_converged={scf}", f"optimization_converged={opt}"]
+    if attempts:
+        details.append(f"attempts={len(attempts)}")
+    return (
+        f"{task_id} did not fully converge "
+        f"({', '.join(details)}). Both scf_conv and opt_conv convergence_achieved must be true."
+    )
+
+
 def record_structure_relaxation_failure(
     workflow_root: Path,
     state: dict[str, Any],
@@ -9080,6 +9164,7 @@ def record_structure_relaxation_failure(
     relaxed_structure: Mapping[str, Any],
     convergence_summary: Mapping[str, Any],
     attempts: list[dict[str, Any]],
+    error_message: str,
 ) -> None:
     failed_structure_relative = str(Path("data_and_plots") / "final_relaxation_failed_structure.json")
     write_json_file(workflow_root / failed_structure_relative, relaxed_structure)
@@ -9096,19 +9181,28 @@ def record_structure_relaxation_failure(
     child["status"] = "failed"
     child["relaxation_converged"] = False
     child["failure_reason"] = "structure_relaxation_failed"
+    child["error"] = error_message
     task["status"] = "failed"
+    task["error"] = error_message
     task["running_child"] = None
     task["result"] = {
         "structure_relaxation_failed": True,
+        "continued_on_failure": True,
+        "continued_structure": failed_structure_relative,
+        "relaxed_structure": failed_structure_relative,
         "failed_structure": failed_structure_relative,
         "failed_structure_template": failed_template_relative,
         "attempts": attempts,
+        "error": error_message,
         **dict(convergence_summary),
     }
     results = state.setdefault("results", {})
     results["final_relaxation_converged"] = False
     results["final_relaxation_failed"] = True
     results["structure_relaxation_failed"] = True
+    results["final_relaxed_structure"] = failed_structure_relative
+    results["final_relaxation_continued_on_failure"] = True
+    results["final_relaxation_output"] = child.get("output")
     results["final_relaxation_failed_structure"] = failed_structure_relative
     results["final_relaxation_failed_structure_template"] = failed_template_relative
 
@@ -10129,7 +10223,7 @@ def run_kpoint_child(
     write_state(state_path, state)
 
     try:
-        ecutwfc = (state.get("results") or {}).get("ecutwfc") if isinstance(state.get("results"), Mapping) else None
+        ecutwfc = effective_workflow_ecutwfc(manifest, state, uses_converged_values=True)
         rendered = render_kpoint_convergence_input(
             base_text,
             kmesh=[int(value) for value in kmesh[:3]],

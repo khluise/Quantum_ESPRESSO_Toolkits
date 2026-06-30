@@ -256,10 +256,9 @@ def _finalize_prepared_qe_template(path: Path, options: Mapping[str, Any]) -> No
     pseudos should be rendered by the later final-relaxation task.
     """
 
-    _ = options
-
     text = path.read_text(encoding="utf-8", errors="ignore")
     updated = remove_namelist_keys(text, "system", {"noncolin", "lspinorb"})
+    updated = apply_manual_ecutwfc_to_qe_text(updated, options)
 
     pseudo_dir = path.parent / PSEUDO_DIR_NAME
     if not pseudo_dir.is_dir():
@@ -272,6 +271,20 @@ def _finalize_prepared_qe_template(path: Path, options: Mapping[str, Any]) -> No
     updated = set_namelist_values(updated, "control", {"pseudo_dir": qe_quote("./pseudo/")})
     if updated != text:
         path.write_text(updated, encoding="utf-8")
+
+
+def apply_manual_ecutwfc_to_qe_text(text: str, options: Mapping[str, Any] | None) -> str:
+    manual_ecutwfc = manual_ecutwfc_from_options(options)
+    if manual_ecutwfc is None:
+        return text
+    return set_namelist_values(
+        text,
+        "system",
+        {
+            "ecutwfc": format_qe_number(manual_ecutwfc),
+            "ecutrho": format_qe_number(manual_ecutwfc * 8.0),
+        },
+    )
 
 
 def _generate_workflow_local(
