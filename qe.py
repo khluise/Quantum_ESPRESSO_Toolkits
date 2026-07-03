@@ -119,6 +119,7 @@ from workflow_builder import (
     _run_generator_command,
     copy_selected_workflow_pseudos,
     create_workflow_files,
+    normalize_relaxation_parameters,
     normalize_qe_fortran_number,
     render_band_scf_input,
     set_namelist_values,
@@ -6602,6 +6603,7 @@ class MainUI(QMainWindow):
             lambda _index: self._workflow_fit_options_tab_height(),
         )
         self.workflowConversionOptionsTab = self._build_workflow_conversion_tab()
+        self.workflowRelaxationOptionsTab = self._build_workflow_relaxation_tab()
         self.workflowPseudosOptionsTab = self._build_workflow_pseudos_tab()
         self.workflowConvergenceOptionsTab = self._build_workflow_convergence_tab()
         self.workflowBandsOptionsTab = self._build_workflow_bands_tab()
@@ -6675,6 +6677,8 @@ class MainUI(QMainWindow):
             self.workflowOptionsTabWidget.addTab(self.workflowConversionOptionsTab, "Conversion")
             if self._workflow_pseudos_tab_needed():
                 self.workflowOptionsTabWidget.addTab(self.workflowPseudosOptionsTab, "Pseudos")
+        if self._selected_relaxation_mode() in {"atomic_positions", "full_geometry"}:
+            self.workflowOptionsTabWidget.addTab(self.workflowRelaxationOptionsTab, "Relaxation")
         if not selected:
             if not has_structure:
                 self.workflowOptionsTabWidget.addTab(
@@ -9367,18 +9371,13 @@ class MainUI(QMainWindow):
         self.workflowUseMaterialsCloudServicesCheckBox.setChecked(True)
         basic_layout.addWidget(QLabel("Conversion service:", basic_group), 4, 0)
         basic_layout.addWidget(self.workflowUseMaterialsCloudServicesCheckBox, 4, 1)
-        self.workflowRelaxPressureLabel = QLabel("Pressure:", basic_group)
-        self.workflowRelaxPressureLineEdit = QLineEdit("0.D0", basic_group)
-        self.workflowRelaxPressureLineEdit.setToolTip("&CELL: press. Accepts decimal, E, or D notation.")
-        self.workflowRelaxPressureConvThrLabel = QLabel("Pressure convergence threshold:", basic_group)
-        self.workflowRelaxPressureConvThrLineEdit = QLineEdit("0.5D0", basic_group)
-        self.workflowRelaxPressureConvThrLineEdit.setToolTip(
-            "&CELL: press_conv_thr. Accepts decimal, E, or D notation."
+        self.workflowConvert2DStructureCheckBox = QCheckBox("Convert for 2D structure", basic_group)
+        self.workflowConvert2DStructureCheckBox.setChecked(False)
+        self.workflowConvert2DStructureCheckBox.setToolTip(
+            "Add assume_isolated = '2D' and vdw_corr = 'Grimme-D3' to &SYSTEM."
         )
-        basic_layout.addWidget(self.workflowRelaxPressureLabel, 5, 0)
-        basic_layout.addWidget(self.workflowRelaxPressureLineEdit, 5, 1)
-        basic_layout.addWidget(self.workflowRelaxPressureConvThrLabel, 6, 0)
-        basic_layout.addWidget(self.workflowRelaxPressureConvThrLineEdit, 6, 1)
+        basic_layout.addWidget(QLabel("2D structure:", basic_group), 5, 0)
+        basic_layout.addWidget(self.workflowConvert2DStructureCheckBox, 5, 1)
         basic_layout.setColumnStretch(1, 1)
         layout.addWidget(basic_group)
         for button in self.workflowSpinOrbitButtons.values():
@@ -9489,9 +9488,78 @@ class MainUI(QMainWindow):
             self._workflow_toggle_conversion_advanced,
         )
         self._workflow_refresh_conversion_service_controls()
-        self._workflow_refresh_relaxation_pressure_controls()
         layout.addWidget(advanced_group)
         layout.addStretch()
+        return panel
+
+    def _build_workflow_relaxation_tab(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        group = QGroupBox("Relaxation parameters", panel)
+        form = QFormLayout(group)
+
+        self.workflowRelaxNstepLineEdit = QLineEdit(group)
+        self.workflowRelaxNstepLineEdit.setPlaceholderText("QE default")
+        self.workflowRelaxNstepLineEdit.setToolTip("&CONTROL: nstep. Leave empty to omit this parameter.")
+
+        self.workflowRelaxElectronMaxstepLineEdit = QLineEdit("80", group)
+        self.workflowRelaxElectronMaxstepLineEdit.setToolTip("&ELECTRONS: electron_maxstep.")
+
+        self.workflowRelaxDiagonalizationCombo = QComboBox(group)
+        self._set_combo_items(
+            self.workflowRelaxDiagonalizationCombo,
+            [
+                ("david", "david"),
+                ("cg", "cg"),
+                ("par0", "par0"),
+                ("rmm-davidson", "rmm-davidson"),
+                ("rmm-paro", "rmm-paro"),
+            ],
+        )
+
+        self.workflowRelaxIonDynamicsCombo = QComboBox(group)
+        self._set_combo_items(
+            self.workflowRelaxIonDynamicsCombo,
+            [("bfgs", "bfgs"), ("damp", "damp")],
+        )
+
+        self.workflowRelaxCellDynamicsCombo = QComboBox(group)
+        self._set_combo_items(
+            self.workflowRelaxCellDynamicsCombo,
+            [("bfgs", "bfgs"), ("damp-pr", "damp-pr"), ("damp-w", "damp-w")],
+        )
+
+        self.workflowRelaxUseIbravAutoCheckBox = QCheckBox("Use automatic ibrav", group)
+        self.workflowRelaxUseIbravAutoCheckBox.setChecked(False)
+        self.workflowRelaxUseIbravAutoCheckBox.setToolTip(
+            "Try to replace ibrav = 0 and CELL_PARAMETERS with an automatically detected QE ibrav."
+        )
+
+        self.workflowRelaxPressureLineEdit = QLineEdit("0.D0", group)
+        self.workflowRelaxPressureLineEdit.setToolTip("&CELL: press. Accepts decimal, E, or D notation.")
+        self.workflowRelaxPressureConvThrLineEdit = QLineEdit("0.5D0", group)
+        self.workflowRelaxPressureConvThrLineEdit.setToolTip(
+            "&CELL: press_conv_thr. Accepts decimal, E, or D notation."
+        )
+
+        form.addRow("nstep:", self.workflowRelaxNstepLineEdit)
+        form.addRow("electron_maxstep:", self.workflowRelaxElectronMaxstepLineEdit)
+        form.addRow("diagonalization:", self.workflowRelaxDiagonalizationCombo)
+        form.addRow("ion_dynamics:", self.workflowRelaxIonDynamicsCombo)
+        form.addRow("cell_dynamics:", self.workflowRelaxCellDynamicsCombo)
+        form.addRow("ibrav:", self.workflowRelaxUseIbravAutoCheckBox)
+        form.addRow("Pressure:", self.workflowRelaxPressureLineEdit)
+        form.addRow("Pressure convergence threshold:", self.workflowRelaxPressureConvThrLineEdit)
+
+        layout.addWidget(group)
+        layout.addStretch()
+        self.workflowRelaxIonDynamicsCombo.currentIndexChanged.connect(
+            lambda _index: self._workflow_refresh_relaxation_dynamics_controls(),
+        )
+        self._workflow_refresh_relaxation_dynamics_controls()
         return panel
 
     def _build_workflow_pseudos_tab(self) -> QWidget:
@@ -9820,6 +9888,28 @@ class MainUI(QMainWindow):
                 widget.setVisible(visible)
         self._workflow_fit_options_tab_height()
 
+    def _workflow_refresh_relaxation_dynamics_controls(self) -> None:
+        if not hasattr(self, "workflowRelaxIonDynamicsCombo") or not hasattr(self, "workflowRelaxCellDynamicsCombo"):
+            return
+        ion = str(self.workflowRelaxIonDynamicsCombo.currentData() or "bfgs")
+        current_cell = str(self.workflowRelaxCellDynamicsCombo.currentData() or "")
+        self.workflowRelaxCellDynamicsCombo.blockSignals(True)
+        try:
+            self.workflowRelaxCellDynamicsCombo.clear()
+            if ion == "damp":
+                self.workflowRelaxCellDynamicsCombo.addItem("damp-pr", "damp-pr")
+                self.workflowRelaxCellDynamicsCombo.addItem("damp-w", "damp-w")
+                target = current_cell if current_cell in {"damp-pr", "damp-w"} else "damp-pr"
+                self._workflow_set_combo_data(self.workflowRelaxCellDynamicsCombo, target)
+                self.workflowRelaxCellDynamicsCombo.setEnabled(True)
+            else:
+                self.workflowRelaxCellDynamicsCombo.addItem("bfgs", "bfgs")
+                self.workflowRelaxCellDynamicsCombo.setCurrentIndex(0)
+                self.workflowRelaxCellDynamicsCombo.setEnabled(False)
+        finally:
+            self.workflowRelaxCellDynamicsCombo.blockSignals(False)
+        self._workflow_fit_options_tab_height()
+
     def _workflow_relaxation_pressure_options(self) -> Dict[str, str]:
         if not self._workflow_relaxation_pressure_controls_visible():
             return {}
@@ -9845,6 +9935,65 @@ class MainUI(QMainWindow):
                 label="pressure convergence threshold",
             ),
         }
+
+    def _workflow_relaxation_options(self) -> Dict[str, Any]:
+        if self._selected_relaxation_mode() not in {"atomic_positions", "full_geometry"}:
+            return {}
+        options = {
+            "nstep": (
+                self.workflowRelaxNstepLineEdit.text().strip()
+                if hasattr(self, "workflowRelaxNstepLineEdit")
+                else ""
+            ),
+            "electron_maxstep": (
+                self.workflowRelaxElectronMaxstepLineEdit.text().strip()
+                if hasattr(self, "workflowRelaxElectronMaxstepLineEdit")
+                else "80"
+            ),
+            "ion_dynamics": (
+                str(self.workflowRelaxIonDynamicsCombo.currentData() or "bfgs")
+                if hasattr(self, "workflowRelaxIonDynamicsCombo")
+                else "bfgs"
+            ),
+            "diagonalization": (
+                str(self.workflowRelaxDiagonalizationCombo.currentData() or "david")
+                if hasattr(self, "workflowRelaxDiagonalizationCombo")
+                else "david"
+            ),
+            "cell_dynamics": (
+                str(self.workflowRelaxCellDynamicsCombo.currentData() or "bfgs")
+                if hasattr(self, "workflowRelaxCellDynamicsCombo")
+                else "bfgs"
+            ),
+            "use_ibrav_auto": (
+                bool(self.workflowRelaxUseIbravAutoCheckBox.isChecked())
+                if hasattr(self, "workflowRelaxUseIbravAutoCheckBox")
+                else False
+            ),
+            **self._workflow_relaxation_pressure_options(),
+        }
+        return normalize_relaxation_parameters(options)
+
+    def _workflow_apply_relaxation_options(self, options: Mapping[str, Any]) -> None:
+        if hasattr(self, "workflowRelaxNstepLineEdit"):
+            self.workflowRelaxNstepLineEdit.setText(str(options.get("nstep") or ""))
+        if hasattr(self, "workflowRelaxElectronMaxstepLineEdit"):
+            self.workflowRelaxElectronMaxstepLineEdit.setText(str(options.get("electron_maxstep") or "80"))
+        if hasattr(self, "workflowRelaxDiagonalizationCombo"):
+            self._workflow_set_combo_data(self.workflowRelaxDiagonalizationCombo, options.get("diagonalization") or "david")
+        if hasattr(self, "workflowRelaxIonDynamicsCombo"):
+            self._workflow_set_combo_data(self.workflowRelaxIonDynamicsCombo, options.get("ion_dynamics") or "bfgs")
+        self._workflow_refresh_relaxation_dynamics_controls()
+        if hasattr(self, "workflowRelaxCellDynamicsCombo"):
+            self._workflow_set_combo_data(self.workflowRelaxCellDynamicsCombo, options.get("cell_dynamics") or "bfgs")
+        if hasattr(self, "workflowRelaxUseIbravAutoCheckBox"):
+            self.workflowRelaxUseIbravAutoCheckBox.setChecked(
+                bool(options.get("use_ibrav_auto") or options.get("ibrav_auto"))
+            )
+        if hasattr(self, "workflowRelaxPressureLineEdit") and options.get("relax_pressure") is not None:
+            self.workflowRelaxPressureLineEdit.setText(str(options.get("relax_pressure")))
+        if hasattr(self, "workflowRelaxPressureConvThrLineEdit") and options.get("relax_pressure_conv_thr") is not None:
+            self.workflowRelaxPressureConvThrLineEdit.setText(str(options.get("relax_pressure_conv_thr")))
 
     def _workflow_prepare_advanced_combo(self, combo: QComboBox) -> None:
         combo.setObjectName("workflowAdvancedCombo")
@@ -10081,6 +10230,7 @@ class MainUI(QMainWindow):
             "output_directory": self.workflowOutputDirectoryLineEdit.text().strip(),
             "description": self.workflowDescriptionEdit.toPlainText().strip(),
             "relaxation_mode": self._selected_relaxation_mode(),
+            "relaxation_parameters": self._workflow_relaxation_options(),
             "selected_workflows": self._selected_workflow_keys(),
             "conversion": self._workflow_draft_conversion_options(),
             "convergence": self._workflow_convergence_options(),
@@ -10125,6 +10275,11 @@ class MainUI(QMainWindow):
             "spin_orbit": self._workflow_checked_button_key(getattr(self, "workflowSpinOrbitButtons", {}), "off"),
             "protocol": self._workflow_checked_button_key(getattr(self, "workflowProtocolButtons", {}), "balanced"),
             "use_materials_cloud": self._workflow_materials_cloud_services_enabled(),
+            "convert_2d_structure": (
+                bool(self.workflowConvert2DStructureCheckBox.isChecked())
+                if hasattr(self, "workflowConvert2DStructureCheckBox")
+                else False
+            ),
             "file_format": self._workflow_combo_value(self.workflowFileFormatCombo, ""),
             "kpoint_distance": kpoint_distance,
             "kmesh_override": kmesh_override,
@@ -10136,12 +10291,6 @@ class MainUI(QMainWindow):
             "threshold_override": self._workflow_combo_value(self.workflowThresholdOverrideCombo, ""),
             "manual_ecutwfc": manual_value,
             "manual_ecutwfc_text": manual_text,
-            "relax_pressure": self.workflowRelaxPressureLineEdit.text() if hasattr(self, "workflowRelaxPressureLineEdit") else "0.D0",
-            "relax_pressure_conv_thr": (
-                self.workflowRelaxPressureConvThrLineEdit.text()
-                if hasattr(self, "workflowRelaxPressureConvThrLineEdit")
-                else "0.5D0"
-            ),
             "local_pseudo_files": dict(getattr(self, "_workflow_local_pseudo_files", {})),
             "full_relativistic_pseudo_files": dict(getattr(self, "_workflow_full_relativistic_pseudo_files", {})),
             "advanced_open": bool(
@@ -10216,6 +10365,12 @@ class MainUI(QMainWindow):
             "output_directory": str(workflow_root.parent if workflow_root else "").strip(),
             "description": str(manifest.get("description") or "").strip(),
             "relaxation_mode": str((manifest.get("relaxation") or {}).get("mode") or "as_is"),
+            "relaxation_parameters": dict(
+                (manifest.get("relaxation") or {}).get("parameters")
+                if isinstance(manifest.get("relaxation"), dict)
+                and isinstance((manifest.get("relaxation") or {}).get("parameters"), dict)
+                else {}
+            ),
             "selected_workflows": selected,
             "conversion": dict(manifest.get("conversion") if isinstance(manifest.get("conversion"), dict) else {}),
             "convergence": dict(manifest.get("convergence") if isinstance(manifest.get("convergence"), dict) else {}),
@@ -10298,7 +10453,13 @@ class MainUI(QMainWindow):
         for key, checkbox in getattr(self, "workflowSelectionCheckboxes", {}).items():
             checkbox.setChecked(key in selected)
 
-        self._workflow_apply_conversion_options(recipe.get("conversion") if isinstance(recipe.get("conversion"), Mapping) else {})
+        conversion_recipe = recipe.get("conversion") if isinstance(recipe.get("conversion"), Mapping) else {}
+        self._workflow_apply_conversion_options(conversion_recipe)
+        self._workflow_apply_relaxation_options(
+            recipe.get("relaxation_parameters")
+            if isinstance(recipe.get("relaxation_parameters"), Mapping)
+            else conversion_recipe
+        )
         self._workflow_apply_convergence_options(recipe.get("convergence") if isinstance(recipe.get("convergence"), Mapping) else {})
         self._workflow_apply_band_options(recipe.get("bands") if isinstance(recipe.get("bands"), Mapping) else {}, warnings_list)
         self._workflow_apply_wannier_options(recipe.get("wannier90") if isinstance(recipe.get("wannier90"), Mapping) else {}, warnings_list)
@@ -10398,6 +10559,8 @@ class MainUI(QMainWindow):
         self._workflow_set_checked_button(getattr(self, "workflowProtocolButtons", {}), protocol, "balanced")
         if hasattr(self, "workflowUseMaterialsCloudServicesCheckBox"):
             self.workflowUseMaterialsCloudServicesCheckBox.setChecked(bool(options.get("use_materials_cloud", True)))
+        if hasattr(self, "workflowConvert2DStructureCheckBox"):
+            self.workflowConvert2DStructureCheckBox.setChecked(bool(options.get("convert_2d_structure", False)))
         manual_text = str(options.get("manual_ecutwfc_text") or "")
         if not manual_text and options.get("manual_ecutwfc") is not None:
             manual_text = f"{options.get('manual_ecutwfc')}"
@@ -10710,6 +10873,11 @@ class MainUI(QMainWindow):
             ),
             "spin_orbit": spin_orbit,
             "use_materials_cloud": use_materials_cloud,
+            "convert_2d_structure": (
+                bool(self.workflowConvert2DStructureCheckBox.isChecked())
+                if hasattr(self, "workflowConvert2DStructureCheckBox")
+                else False
+            ),
             "protocol": protocol,
             "local_protocol": protocol_map.get(protocol, DEFAULT_PROTOCOL),
             "file_format": self._workflow_combo_value(self.workflowFileFormatCombo, ""),
@@ -10730,7 +10898,6 @@ class MainUI(QMainWindow):
                 else {}
             ),
         }
-        options.update(self._workflow_relaxation_pressure_options())
         return options
 
     def _selected_workflow_keys(self) -> List[str]:
@@ -11189,6 +11356,7 @@ class MainUI(QMainWindow):
 
         try:
             conversion_options = self._workflow_conversion_options()
+            relaxation_options = self._workflow_relaxation_options()
         except ValueError as exc:
             self._show_error(str(exc))
             return
@@ -11240,6 +11408,7 @@ class MainUI(QMainWindow):
             description=self.workflowDescriptionEdit.toPlainText().strip(),
             queue="default",
             conversion_options=conversion_options,
+            relaxation_options=relaxation_options,
             convergence_options=convergence_options,
             band_options=band_options,
             wannier_options=wannier_options,

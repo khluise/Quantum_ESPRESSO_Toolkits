@@ -43,6 +43,11 @@ def main() -> int:
         help="Optional JSON object with full convergence settings.",
     )
     parser.add_argument(
+        "--relaxation-json",
+        default="",
+        help="Optional JSON object with relaxation parameter settings.",
+    )
+    parser.add_argument(
         "--band-json",
         default="",
         help="Optional JSON object with band/fat-band settings.",
@@ -115,6 +120,7 @@ def main() -> int:
     args = parser.parse_args()
 
     conversion_options = parse_json_object(args.conversion_json, "--conversion-json")
+    relaxation_options = parse_json_object(args.relaxation_json, "--relaxation-json")
     convergence_options = parse_json_object(args.convergence_json, "--convergence-json")
     band_options = parse_json_object(args.band_json, "--band-json")
     phonon_options = parse_json_object(args.phonon_json, "--phonon-json")
@@ -143,6 +149,7 @@ def main() -> int:
         description=args.description,
         queue=args.queue,
         conversion_options=conversion_options,
+        relaxation_options=relaxation_options,
         convergence_options=convergence_options,
         band_options=band_options,
         elastic_options=elastic_options,

@@ -122,6 +122,28 @@ RELAXATION_CELL_NAMELIST = [
 
 DEFAULT_RELAX_PRESS = "0.D0"
 DEFAULT_RELAX_PRESS_CONV_THR = "0.5D0"
+DEFAULT_RELAX_ELECTRON_MAXSTEP = "80"
+DEFAULT_RELAX_DIAGONALIZATION = "david"
+DEFAULT_RELAX_ION_DYNAMICS = "bfgs"
+DEFAULT_RELAX_CELL_DYNAMICS = "bfgs"
+RELAX_DIAGONALIZATION_VALUES = {"david", "cg", "par0", "rmm-davidson", "rmm-paro"}
+RELAX_ION_DYNAMICS_VALUES = {"bfgs", "damp"}
+RELAX_CELL_DYNAMICS_VALUES = {"bfgs", "damp-pr", "damp-w"}
+RELAX_SYSTEM_LATTICE_KEYS = {
+    "ibrav",
+    "celldm(1)",
+    "celldm(2)",
+    "celldm(3)",
+    "celldm(4)",
+    "celldm(5)",
+    "celldm(6)",
+    "a",
+    "b",
+    "c",
+    "cosab",
+    "cosac",
+    "cosbc",
+}
 
 
 def sanitize_job_name(name: str) -> str:
@@ -259,6 +281,7 @@ def _finalize_prepared_qe_template(path: Path, options: Mapping[str, Any]) -> No
     text = path.read_text(encoding="utf-8", errors="ignore")
     updated = remove_namelist_keys(text, "system", {"noncolin", "lspinorb"})
     updated = apply_manual_ecutwfc_to_qe_text(updated, options)
+    updated = apply_2d_structure_options_to_qe_text(updated, options)
 
     pseudo_dir = path.parent / PSEUDO_DIR_NAME
     if not pseudo_dir.is_dir():
@@ -283,6 +306,19 @@ def apply_manual_ecutwfc_to_qe_text(text: str, options: Mapping[str, Any] | None
         {
             "ecutwfc": format_qe_number(manual_ecutwfc),
             "ecutrho": format_qe_number(manual_ecutwfc * 8.0),
+        },
+    )
+
+
+def apply_2d_structure_options_to_qe_text(text: str, options: Mapping[str, Any] | None) -> str:
+    if not isinstance(options, Mapping) or not _truthy_option(options.get("convert_2d_structure")):
+        return text
+    return set_namelist_values(
+        text,
+        "system",
+        {
+            "assume_isolated": qe_quote("2D"),
+            "vdw_corr": qe_quote("Grimme-D3"),
         },
     )
 
@@ -734,6 +770,286 @@ def apply_relaxation_pressure_options(text: str, options: Mapping[str, Any]) -> 
     )
 
 
+def normalize_relaxation_parameters(
+    options: Mapping[str, Any] | None,
+    *,
+    legacy_conversion_options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize workflow relaxation parameters from GUI/CLI/manifest sources."""
+
+    raw = dict(options or {})
+    legacy = dict(legacy_conversion_options or {})
+
+    nstep = normalize_optional_positive_int_text(raw.get("nstep"), "nstep")
+    electron_maxstep = normalize_optional_positive_int_text(
+        raw.get("electron_maxstep", DEFAULT_RELAX_ELECTRON_MAXSTEP),
+        "electron_maxstep",
+    )
+    if not electron_maxstep:
+        electron_maxstep = DEFAULT_RELAX_ELECTRON_MAXSTEP
+
+    diagonalization = str(raw.get("diagonalization") or DEFAULT_RELAX_DIAGONALIZATION).strip().lower()
+    if diagonalization not in RELAX_DIAGONALIZATION_VALUES:
+        diagonalization = DEFAULT_RELAX_DIAGONALIZATION
+
+    ion_dynamics = str(raw.get("ion_dynamics") or DEFAULT_RELAX_ION_DYNAMICS).strip().lower()
+    if ion_dynamics not in RELAX_ION_DYNAMICS_VALUES:
+        ion_dynamics = DEFAULT_RELAX_ION_DYNAMICS
+
+    requested_cell = str(raw.get("cell_dynamics") or "").strip().lower()
+    if ion_dynamics == "bfgs":
+        cell_dynamics = "bfgs"
+    else:
+        cell_dynamics = requested_cell if requested_cell in {"damp-pr", "damp-w"} else "damp-pr"
+
+    pressure_source = raw.get("relax_pressure", legacy.get("relax_pressure"))
+    pressure_conv_source = raw.get("relax_pressure_conv_thr", legacy.get("relax_pressure_conv_thr"))
+    pressure = normalize_qe_fortran_number(
+        pressure_source,
+        default=DEFAULT_RELAX_PRESS,
+        label="pressure",
+    )
+    pressure_conv_thr = normalize_qe_fortran_number(
+        pressure_conv_source,
+        default=DEFAULT_RELAX_PRESS_CONV_THR,
+        label="pressure convergence threshold",
+    )
+
+    return {
+        "nstep": nstep,
+        "electron_maxstep": electron_maxstep,
+        "diagonalization": diagonalization,
+        "ion_dynamics": ion_dynamics,
+        "cell_dynamics": cell_dynamics,
+        "convert_2d_structure": _truthy_option(raw.get("convert_2d_structure")),
+        "use_ibrav_auto": _truthy_option(raw.get("use_ibrav_auto") or raw.get("ibrav_auto")),
+        "relax_pressure": pressure,
+        "relax_pressure_conv_thr": pressure_conv_thr,
+    }
+
+
+def normalize_optional_positive_int_text(value: Any, label: str) -> str:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return ""
+    try:
+        number = int(text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a positive integer.") from exc
+    if number <= 0:
+        raise ValueError(f"{label} must be a positive integer.")
+    return str(number)
+
+
+def apply_relaxation_parameters(
+    text: str,
+    parameters: Mapping[str, Any] | None,
+) -> str:
+    """Apply workflow relaxation parameters to ``pw.x`` relax/vc-relax input."""
+
+    options = normalize_relaxation_parameters(parameters)
+    rendered = text
+    control_values: dict[str, str] = {}
+    if str(options.get("nstep") or "").strip():
+        control_values["nstep"] = str(options["nstep"])
+    if control_values:
+        rendered = set_namelist_values(rendered, "control", control_values)
+    rendered = set_namelist_values(
+        rendered,
+        "electrons",
+        {
+            "electron_maxstep": str(options["electron_maxstep"]),
+            "diagonalization": qe_quote(str(options["diagonalization"])),
+        },
+    )
+    rendered = set_namelist_values(
+        rendered,
+        "ions",
+        {"ion_dynamics": qe_quote(str(options["ion_dynamics"]))},
+    )
+    rendered = set_namelist_values(
+        rendered,
+        "cell",
+        {
+            "cell_dofree": qe_quote("2Dxy") if bool(options.get("convert_2d_structure")) else qe_quote("ibrav"),
+            "cell_dynamics": qe_quote(str(options["cell_dynamics"])),
+            "press": str(options["relax_pressure"]),
+            "press_conv_thr": str(options["relax_pressure_conv_thr"]),
+        },
+    )
+    if bool(options.get("use_ibrav_auto")):
+        rendered, _warning = apply_ibrav_auto_to_qe_input(rendered)
+    else:
+        rendered = force_qe_input_ibrav_zero(rendered)
+    return rendered
+
+
+def force_qe_input_ibrav_zero(text: str) -> str:
+    """Keep the workflow default explicit-cell representation."""
+
+    if extract_cell_vectors(text) is None:
+        return text
+    return set_namelist_values(text, "system", {"ibrav": "0"})
+
+
+def apply_ibrav_auto_to_qe_input(text: str) -> tuple[str, str | None]:
+    """Try to convert an explicit-cell QE input to nonzero ``ibrav``.
+
+    Returns ``(updated_text, warning)``.  On any unsafe or unsupported case, the
+    input is returned as ``ibrav = 0`` with ``CELL_PARAMETERS`` preserved.
+    """
+
+    try:
+        atoms = atoms_from_qe_explicit_cell_input(text)
+        if atoms is None:
+            return force_qe_input_ibrav_zero(text), "Could not parse explicit-cell QE structure for ibrav auto."
+
+        from qeinputgeneratorscrapper.make_pw_input_from_cif import (  # type: ignore
+            DEFAULT_SYMPREC,
+            IBRAV_AUTO,
+            fractional_positions_for_qe_lattice,
+            qe_lattice_float,
+            resolve_qe_lattice,
+        )
+
+        qe_lattice, warning = resolve_qe_lattice(atoms, ibrav_request=IBRAV_AUTO, symprec=DEFAULT_SYMPREC)
+        if qe_lattice is None:
+            return force_qe_input_ibrav_zero(text), warning or "Could not detect a safe nonzero ibrav."
+
+        scaled_positions = fractional_positions_for_qe_lattice(atoms, qe_lattice)
+        symbols = atoms.get_chemical_symbols()
+        atomic_lines = []
+        for symbol, position in zip(symbols, scaled_positions):
+            x, y, z = [float(value) % 1.0 for value in position[:3]]
+            atomic_lines.append(f"{symbol:<2} {x:20.10f}{y:19.10f}{z:19.10f}")
+
+        rendered = replace_qe_card(text, "ATOMIC_POSITIONS", "ATOMIC_POSITIONS crystal", atomic_lines)
+        rendered = remove_qe_card(rendered, "CELL_PARAMETERS")
+        rendered = remove_namelist_keys(rendered, "system", RELAX_SYSTEM_LATTICE_KEYS)
+        system_values = {"ibrav": str(qe_lattice.ibrav), "nosym": ".true."}
+        for name, value in qe_lattice.parameters:
+            system_values[str(name)] = qe_lattice_float(float(value))
+        rendered = set_namelist_values(rendered, "system", system_values)
+        return rendered, warning
+    except Exception as exc:  # noqa: BLE001 - fallback is intentional for workflow robustness
+        return force_qe_input_ibrav_zero(text), f"Could not apply ibrav auto: {exc}"
+
+
+def atoms_from_qe_explicit_cell_input(text: str) -> Any | None:
+    cell = extract_cell_vectors(text)
+    if cell is None:
+        return None
+    atomic = extract_qe_atomic_positions(text)
+    if atomic is None:
+        return None
+
+    header, rows = atomic
+    mode = qe_card_unit(header, default="alat")
+    symbols: list[str] = []
+    coords: list[list[float]] = []
+    for row in rows:
+        parts = row.split()
+        if len(parts) < 4:
+            return None
+        try:
+            coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+        except ValueError:
+            return None
+        symbols.append(parts[0])
+
+    try:
+        from ase import Atoms  # type: ignore
+    except Exception:
+        return None
+
+    if mode.startswith("crystal"):
+        return Atoms(symbols=symbols, scaled_positions=coords, cell=cell, pbc=True)
+
+    if mode in {"angstrom", "ang"}:
+        return Atoms(symbols=symbols, positions=coords, cell=cell, pbc=True)
+
+    scale = qe_position_scale_to_angstrom(text, mode)
+    if scale is None:
+        return None
+    positions = [[component * scale for component in coord] for coord in coords]
+    return Atoms(symbols=symbols, positions=positions, cell=cell, pbc=True)
+
+
+def qe_position_scale_to_angstrom(text: str, mode: str) -> float | None:
+    unit = str(mode or "").strip().lower()
+    if unit in {"bohr", "a.u.", "au"}:
+        return BOHR_TO_ANGSTROM
+    if unit in {"alat", ""}:
+        system = parse_namelist_values(text, "system")
+        alat_bohr = parse_qe_float(system.get("celldm(1)") or system.get("celldm1"))
+        if alat_bohr is not None:
+            return alat_bohr * BOHR_TO_ANGSTROM
+        alat_angstrom = parse_qe_float(system.get("a"))
+        if alat_angstrom is not None:
+            return alat_angstrom
+    return None
+
+
+def extract_qe_atomic_positions(text: str) -> tuple[str, list[str]] | None:
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.upper().startswith("ATOMIC_POSITIONS"):
+            continue
+        rows: list[str] = []
+        end_idx = idx + 1
+        while end_idx < len(lines):
+            candidate = lines[end_idx].strip()
+            if not candidate:
+                break
+            upper = candidate.upper()
+            if upper.startswith(("ATOMIC_SPECIES", "ATOMIC_POSITIONS", "CELL_PARAMETERS", "K_POINTS")):
+                break
+            if candidate.startswith("&") or candidate.startswith("/"):
+                break
+            rows.append(lines[end_idx])
+            end_idx += 1
+        return line, rows
+    return None
+
+
+def qe_card_unit(header: str, *, default: str = "") -> str:
+    stripped = str(header or "").strip()
+    match = re.search(r"\(([^)]+)\)", stripped)
+    if match:
+        return match.group(1).strip().lower()
+    parts = stripped.split(None, 1)
+    if len(parts) > 1:
+        return parts[1].strip().lower().strip("{}")
+    return default
+
+
+def remove_qe_card(text: str, card_name: str) -> str:
+    lines = text.splitlines()
+    target = card_name.strip().upper()
+    start_idx = None
+    for idx, line in enumerate(lines):
+        if line.strip().upper().startswith(target):
+            start_idx = idx
+            break
+    if start_idx is None:
+        return text
+    end_idx = start_idx + 1
+    while end_idx < len(lines):
+        stripped = lines[end_idx].strip()
+        if not stripped:
+            break
+        upper = stripped.upper()
+        if upper.startswith(("ATOMIC_SPECIES", "ATOMIC_POSITIONS", "CELL_PARAMETERS", "K_POINTS")):
+            break
+        if stripped.startswith("&") or stripped.startswith("/"):
+            break
+        end_idx += 1
+    suffix = "\n" if text.endswith("\n") else ""
+    del lines[start_idx:end_idx]
+    return "\n".join(lines) + suffix
+
+
 def relaxation_namelist_insert_index(lines: Sequence[str]) -> int:
     """Return the place where &IONS/&CELL should sit in a relax input."""
 
@@ -755,6 +1071,7 @@ def render_initial_relaxation_input(
     child_workdir: str | Path,
     child_id: str,
     conversion_options: Mapping[str, Any] | None = None,
+    relaxation_options: Mapping[str, Any] | None = None,
     spin_orbit_required: bool | None = None,
 ) -> str:
     """Render the rough initial relax/vc-relax input from QE_input.template."""
@@ -844,7 +1161,9 @@ def render_initial_relaxation_input(
         )
 
     rendered = ensure_relaxation_namelists(rendered)
-    return apply_relaxation_pressure_options(rendered, options)
+    parameters = normalize_relaxation_parameters(relaxation_options, legacy_conversion_options=options)
+    parameters["convert_2d_structure"] = _truthy_option(options.get("convert_2d_structure"))
+    return apply_relaxation_parameters(rendered, parameters)
 
 
 def render_final_relaxation_input(
@@ -857,6 +1176,7 @@ def render_final_relaxation_input(
     ecutwfc: int | float | None = None,
     kmesh: Sequence[int] | None = None,
     conversion_options: Mapping[str, Any] | None = None,
+    relaxation_options: Mapping[str, Any] | None = None,
     spin_orbit_required: bool | None = None,
 ) -> str:
     """Render the final relax/vc-relax input using converged workflow values."""
@@ -922,7 +1242,9 @@ def render_final_relaxation_input(
         )
 
     rendered = ensure_relaxation_namelists(rendered)
-    return apply_relaxation_pressure_options(rendered, options)
+    parameters = normalize_relaxation_parameters(relaxation_options, legacy_conversion_options=options)
+    parameters["convert_2d_structure"] = _truthy_option(options.get("convert_2d_structure"))
+    return apply_relaxation_parameters(rendered, parameters)
 
 
 def render_band_scf_input(
@@ -1058,7 +1380,7 @@ def render_charge_density_pp_input(
         "&INPUTPP",
         f"     prefix={qe_quote(safe_prefix)},",
         f"     outdir={qe_quote(outdir or './out/')},",
-        "     plot_num=0,",
+        "     plot_num=8,",
         "/",
         "&PLOT",
         "iflag=3,",
@@ -2356,6 +2678,7 @@ class WorkflowBuildRequest:
     description: str = ""
     queue: str = "default"
     conversion_options: Mapping[str, Any] = field(default_factory=dict)
+    relaxation_options: Mapping[str, Any] = field(default_factory=dict)
     convergence_options: Mapping[str, Any] = field(default_factory=dict)
     band_options: Mapping[str, Any] = field(default_factory=dict)
     wannier_options: Mapping[str, Any] = field(default_factory=dict)
@@ -2439,6 +2762,10 @@ def build_workflow_manifest(request: WorkflowBuildRequest) -> dict[str, Any]:
     force_conversion = should_force_source_conversion(source_path, conversion_options)
     source_info = build_source_info(source_path, force_conversion=force_conversion)
     convergence_options = normalize_convergence_options(request.convergence_options)
+    relaxation_options = normalize_relaxation_parameters(
+        request.relaxation_options,
+        legacy_conversion_options=conversion_options,
+    )
     band_options = normalize_band_options(request.band_options)
     wannier_options = normalize_wannier_options(request.wannier_options)
     dos_options = normalize_dos_options(request.dos_options)
@@ -2450,6 +2777,7 @@ def build_workflow_manifest(request: WorkflowBuildRequest) -> dict[str, Any]:
     tasks = build_manifest_tasks(
         selected_workflows=selected,
         relaxation_mode=relaxation_mode,
+        relaxation_options=relaxation_options,
         convergence_options=convergence_options,
         band_options=band_options,
         wannier_options=wannier_options,
@@ -2481,6 +2809,7 @@ def build_workflow_manifest(request: WorkflowBuildRequest) -> dict[str, Any]:
         "conversion": conversion_options,
         "relaxation": {
             "mode": relaxation_mode,
+            "parameters": relaxation_options,
         },
         "selected_workflows": selected,
         "convergence": convergence_options,
@@ -2731,6 +3060,7 @@ def build_manifest_tasks(
     *,
     selected_workflows: Sequence[str],
     relaxation_mode: str,
+    relaxation_options: Mapping[str, Any],
     convergence_options: Mapping[str, Any],
     band_options: Mapping[str, Any],
     wannier_options: Mapping[str, Any],
@@ -2787,7 +3117,7 @@ def build_manifest_tasks(
     if has_relaxation and has_convergence:
         # When both are selected: do a rough initial relaxation first so convergence
         # runs on a better structure, then do final relaxation after convergence.
-        initial_task = build_relaxation_task(relaxation_mode, "initial", dependency)
+        initial_task = build_relaxation_task(relaxation_mode, "initial", dependency, relaxation_options)
         tasks.append(initial_task)
         dependency = "initial_relaxation"
 
@@ -2805,7 +3135,7 @@ def build_manifest_tasks(
         dependency = str(task["id"])
 
     if has_relaxation:
-        final_task = build_relaxation_task(relaxation_mode, "final", dependency)
+        final_task = build_relaxation_task(relaxation_mode, "final", dependency, relaxation_options)
         final_params = dict(final_task.get("params") or {})
         if has_convergence:
             # Final relaxation should start from the initial-relaxed structure.
@@ -3023,7 +3353,12 @@ def build_manifest_tasks(
     return tasks
 
 
-def build_relaxation_task(relaxation_mode: str, stage: str, dependency: str) -> dict[str, Any]:
+def build_relaxation_task(
+    relaxation_mode: str,
+    stage: str,
+    dependency: str,
+    relaxation_options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     calc_type = "qe.vc_relax" if relaxation_mode == "full_geometry" else "qe.relax"
     base_label = "Full geometry relaxation" if relaxation_mode == "full_geometry" else "Atomic positions relaxation"
     stage_key = stage if stage in {"initial", "final", "single"} else "single"
@@ -3064,6 +3399,7 @@ def build_relaxation_task(relaxation_mode: str, stage: str, dependency: str) -> 
             "uses_converged_values": False,
         }
 
+    params["relaxation_parameters"] = dict(relaxation_options or {})
     return {
         "id": task_id,
         "type": calc_type,

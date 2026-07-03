@@ -420,6 +420,7 @@ def run_initial_relaxation(manifest: Mapping[str, Any], state: dict[str, Any], s
             child_workdir=child.get("workdir") or "",
             child_id=str(child.get("id") or "initial_relaxation"),
             conversion_options=manifest.get("conversion") or {},
+            relaxation_options=relaxation_parameters_for_child(manifest, child),
         )
         input_path.write_text(rendered, encoding="utf-8")
         append_log(child_log_path, f"Wrote initial relaxation input: {input_path}\n")
@@ -8860,6 +8861,7 @@ def run_accuracy_relaxation_task(
             ecutwfc=ecutwfc,
             kmesh=kmesh if isinstance(kmesh, list) else None,
             conversion_options=manifest.get("conversion") or {},
+            relaxation_options=relaxation_parameters_for_child(manifest, child),
         )
         attempt = run_relaxation_attempt(
             rendered,
@@ -8898,6 +8900,7 @@ def run_accuracy_relaxation_task(
                 ecutwfc=ecutwfc,
                 kmesh=kmesh if isinstance(kmesh, list) else None,
                 conversion_options=manifest.get("conversion") or {},
+                relaxation_options=relaxation_parameters_for_child(manifest, child),
             )
             attempt = run_relaxation_attempt(
                 retry_rendered,
@@ -10541,6 +10544,19 @@ def optional_positive_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return number if number > 0 else None
+
+
+def relaxation_parameters_for_child(
+    manifest: Mapping[str, Any],
+    child: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    params = child.get("params") if isinstance(child.get("params"), Mapping) else {}
+    child_options = params.get("relaxation_parameters") if isinstance(params, Mapping) else None
+    if isinstance(child_options, Mapping) and child_options:
+        return child_options
+    relaxation = manifest.get("relaxation") if isinstance(manifest.get("relaxation"), Mapping) else {}
+    manifest_options = relaxation.get("parameters") if isinstance(relaxation, Mapping) else None
+    return manifest_options if isinstance(manifest_options, Mapping) else {}
 
 
 def workflow_task_state(state: Mapping[str, Any], task_id: str) -> dict[str, Any] | None:
