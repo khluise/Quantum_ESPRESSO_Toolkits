@@ -313,6 +313,45 @@ def _resolve_thermo_pw_candidate(candidate: str) -> tuple[str, str]:
     return bin_dir or "", resolved_thermo or ""
 
 
+def _dedupe_existing_paths(paths: Sequence[Path]) -> list[Path]:
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        try:
+            candidate = path.expanduser()
+            key = str(candidate.resolve(strict=False))
+        except Exception:
+            candidate = path
+            key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if candidate.exists():
+                unique.append(candidate)
+        except Exception:
+            continue
+    return unique
+
+
+def _sort_executable_bin_dirs(bin_dirs: Sequence[str]) -> list[str]:
+    def priority(value: str) -> tuple[int, str]:
+        path = Path(value)
+        name = path.name.lower()
+        parent = path.parent.name.lower()
+        if name == "bin" and parent != "build":
+            rank = 0
+        elif name == "bin":
+            rank = 1
+        elif name == "src":
+            rank = 3
+        else:
+            rank = 2
+        return rank, str(path).casefold()
+
+    return sorted(bin_dirs, key=priority)
+
+
 ELEMENT_SYMBOLS: set[str] = {
     "H",
     "He",
@@ -1714,14 +1753,23 @@ class QePathSearchThread(QThread):
         return matches
 
     def run(self) -> None:  # noqa: D401 (Qt override)
-        home_results = self._run_find(Path.home())
-        if home_results:
-            self.finished_with_results.emit(home_results)
-            return
+        roots = [PROJECT_ROOT, Path.cwd()]
+        if PROJECT_ROOT.name == "QE_automation_GUI":
+            roots.append(PROJECT_ROOT.parent)
+        cwd = Path.cwd()
+        if cwd.name == "QE_automation_GUI":
+            roots.append(cwd.parent)
+        roots.append(Path.home())
+        search_roots = _dedupe_existing_paths(roots)
+        for root in search_roots:
+            results = self._run_find(root)
+            if results:
+                self.finished_with_results.emit(results)
+                return
 
         self.status_changed.emit(f"Searching system-wide for {self.executable_name}...")
         self.log_appended.emit(
-            f"No {self.executable_name} found in the home directory. "
+            f"No {self.executable_name} found in the project, current, or home directories. "
             "Searching system-wide (this may take a while)..."
         )
         system_results = self._run_find(Path("/"))
@@ -1896,8 +1944,18 @@ class QeInstallThread(QThread):
             return
 
         self._set_stage("validate")
-        preferred = str(self.install_dir / "bin" / self.executable_name)
-        preferred_valid = self._filter_valid_candidates([preferred], self.executable_name)
+        preferred_candidates = [
+            str(self.install_dir / "bin" / self.executable_name),
+            str(self.install_dir / "build" / "bin" / self.executable_name),
+        ]
+        for child in sorted(self.install_dir.glob("q-e-*")):
+            preferred_candidates.extend(
+                [
+                    str(child / "bin" / self.executable_name),
+                    str(child / "build" / "bin" / self.executable_name),
+                ]
+            )
+        preferred_valid = self._filter_valid_candidates(preferred_candidates, self.executable_name)
 
         paths = preferred_valid or self._filter_valid_candidates(
             self._find_binaries(self.executable_name),
@@ -2435,6 +2493,9 @@ class SystemConfigDialog(QDialog):
         self._thermo_detect_thread: Optional[QThread] = None
         self._thermo_install_thread: Optional[QThread] = None
         self._thermo_progress_dialog: Optional[QDialog] = None
+        self._pending_qe_install_dir: Optional[Path] = None
+        self._pending_qe_install_password = ""
+        self._pending_qe_install_qe_bin = ""
 
         layout = QVBoxLayout(self)
 
@@ -2618,6 +2679,7 @@ class SystemConfigDialog(QDialog):
         self._finalize_qe_progress(success)
         self._qe_install_thread = None
         if not success:
+            self._clear_pending_qe_install()
             detail = message or "Automatic installation failed."
             QMessageBox.warning(
                 self,
@@ -2627,19 +2689,50 @@ class SystemConfigDialog(QDialog):
             return
 
         qe_bin = self._set_first_qe_result(paths)
-        thermo_bin = self._set_first_thermo_result(thermo_paths)
-        message_parts: list[str] = []
-        if qe_bin:
-            message_parts.append(f"Quantum ESPRESSO bin directory:\n{qe_bin}")
-        if thermo_bin:
-            message_parts.append(f"thermo_pw bin directory:\n{thermo_bin}")
-        if not message_parts:
+        if not qe_bin:
+            self._clear_pending_qe_install()
             self._handle_qe_search_results(paths)
             return
+
+        self._pending_qe_install_qe_bin = qe_bin
+        if self._start_followup_thermo_install():
+            return
+
+        self._clear_pending_qe_install()
         QMessageBox.information(
             self,
             "Installation configured",
-            "\n\n".join(message_parts),
+            f"Quantum ESPRESSO bin directory:\n{qe_bin}",
+        )
+
+    def _on_qe_followup_thermo_install_finished(
+        self,
+        success: bool,
+        message: str,
+        paths: list[str],
+        _extra_paths: list[str],
+    ) -> None:
+        self._finalize_thermo_progress(success)
+        self._thermo_install_thread = None
+
+        qe_bin = self._pending_qe_install_qe_bin
+        self._clear_pending_qe_install()
+
+        thermo_bin = self._set_first_thermo_result(paths) if success else ""
+        if success and thermo_bin:
+            QMessageBox.information(
+                self,
+                "Installation configured",
+                f"Quantum ESPRESSO bin directory:\n{qe_bin}\n\nthermo_pw bin directory:\n{thermo_bin}",
+            )
+            return
+
+        detail = message or "Automatic thermo_pw installation failed."
+        QMessageBox.warning(
+            self,
+            "thermo_pw installation failed",
+            f"Quantum ESPRESSO was configured successfully:\n{qe_bin}\n\n"
+            f"{detail}\n\nYou can retry using the Thermo_pw Configure button.",
         )
 
     def _on_thermo_pw_install_finished(
@@ -2929,6 +3022,9 @@ class SystemConfigDialog(QDialog):
             allow_cancel=True,
             initial_status="Downloading Quantum ESPRESSO...",
         )
+        self._pending_qe_install_dir = Path(install_dir)
+        self._pending_qe_install_password = password
+        self._pending_qe_install_qe_bin = ""
         self._qe_progress_dialog = dialog
         thread = QeInstallThread(
             Path(install_dir),
@@ -2936,8 +3032,7 @@ class SystemConfigDialog(QDialog):
             self,
             executable_name="pw.x",
             display_name="Quantum ESPRESSO",
-            install_args=["--with-thermo"],
-            extra_executable_name="thermo_pw.x",
+            install_args=["--latest", "--compile"],
         )
         self._qe_install_thread = thread
 
@@ -2948,6 +3043,44 @@ class SystemConfigDialog(QDialog):
 
         dialog.show()
         thread.start()
+
+    def _start_followup_thermo_install(self) -> bool:
+        install_dir = self._pending_qe_install_dir
+        password = self._pending_qe_install_password
+        self._pending_qe_install_password = ""
+        if install_dir is None or not password:
+            return False
+
+        dialog = QeConfigureProgressDialog(
+            "Installing thermo_pw",
+            self,
+            allow_cancel=True,
+            initial_status="Installing thermo_pw...",
+        )
+        self._thermo_progress_dialog = dialog
+        thread = QeInstallThread(
+            install_dir,
+            password,
+            self,
+            executable_name="thermo_pw.x",
+            display_name="thermo_pw",
+            install_args=["--thermo-only"],
+        )
+        self._thermo_install_thread = thread
+
+        dialog.cancel_requested.connect(thread.request_stop)
+        thread.log_appended.connect(dialog.append_log)
+        thread.status_changed.connect(dialog.set_status)
+        thread.finished_with_result.connect(self._on_qe_followup_thermo_install_finished)
+
+        dialog.show()
+        thread.start()
+        return True
+
+    def _clear_pending_qe_install(self) -> None:
+        self._pending_qe_install_dir = None
+        self._pending_qe_install_password = ""
+        self._pending_qe_install_qe_bin = ""
 
     def _run_thermo_pw_install_flow(self) -> None:
         install_dir = QFileDialog.getExistingDirectory(
@@ -3009,7 +3142,7 @@ class SystemConfigDialog(QDialog):
                 continue
             if bin_dir not in details:
                 details[bin_dir] = {"candidate": candidate, "resolved_pw": resolved_pw}
-        return sorted(details.keys()), details
+        return _sort_executable_bin_dirs(list(details.keys())), details
 
     def _normalize_qe_bin_dir(self, raw: str) -> str:
         bin_dir, _ = _resolve_pw_candidate(raw)
@@ -3023,7 +3156,7 @@ class SystemConfigDialog(QDialog):
                 continue
             if bin_dir not in details:
                 details[bin_dir] = {"candidate": candidate, "resolved_thermo": resolved_thermo}
-        return sorted(details.keys()), details
+        return _sort_executable_bin_dirs(list(details.keys())), details
 
     def _normalize_thermo_pw_bin_dir(self, raw: str) -> str:
         bin_dir, _ = _resolve_thermo_pw_candidate(raw)
