@@ -1,1 +1,8 @@
 __pycache__/
+qe_helper/__pycache__/
+qeinputgeneratorscrapper/__pycache__/
+*.py[cod]
+*$py.class
+CODEBASE_MAP.md
+run_qe_gui.sh
+scripts/

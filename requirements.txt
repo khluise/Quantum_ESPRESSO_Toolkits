@@ -1,7 +1,11 @@
 filelock>=3.12.0
-pyqt6
-seekpath
 ase
 beautifulsoup4
+matplotlib
+numpy
+pandas
+pyqt6
 requests
 scipy>=1.7
+seekpath
+spglib
