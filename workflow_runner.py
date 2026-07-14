@@ -77,6 +77,7 @@ from workflow_builder import (
     set_namelist_values,
     write_json_file,
 )
+from qe_helper.config import load_system_config
 from qe_helper.kpoints import generate_crystal_kmesh
 
 
@@ -10712,6 +10713,17 @@ def load_qe_command_base(executable: str) -> str:
         command = str(commands.get(exe) or "").strip()
         if command:
             return command
+    try:
+        system_config = load_system_config()
+        if exe == "thermo_pw.x":
+            bin_dir_text = str(getattr(system_config, "thermo_pw_path", "") or "").strip()
+        else:
+            bin_dir_text = str(getattr(system_config, "qe_path", "") or "").strip()
+        if bin_dir_text:
+            candidate = Path(bin_dir_text).expanduser() / exe
+            return shlex.quote(str(candidate))
+    except Exception:
+        pass
     return exe
 
 

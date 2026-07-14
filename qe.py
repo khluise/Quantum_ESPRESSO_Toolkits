@@ -3275,7 +3275,7 @@ class SystemConfigDialog(QDialog):
 
 
 class CommandPreferencesDialog(QDialog):
-    _NO_MPI_DEFAULT_COMMANDS = {"alpha2f.x", "projwfc.x", "fermi_velocity.x", "lambda.x"}
+    _NO_MPI_DEFAULT_COMMANDS = {"alpha2f.x", "projwfc.x", "sumpdos.x", "fermi_velocity.x", "lambda.x"}
 
     def __init__(self, parent: Optional[Any] = None) -> None:
         super().__init__(parent)
@@ -3347,6 +3347,7 @@ class CommandPreferencesDialog(QDialog):
             ("bands.x command", "bands.x"),
             ("dos.x command", "dos.x"),
             ("projwfc.x command", "projwfc.x"),
+            ("sumpdos.x command", "sumpdos.x"),
             ("fermi_velocity.x command", "fermi_velocity.x"),
             ("pp.x command", "pp.x"),
             ("thermo_pw.x command", "thermo_pw.x"),
@@ -3382,6 +3383,7 @@ class CommandPreferencesDialog(QDialog):
             "bands.x": with_prefix("bands.x"),
             "dos.x": with_prefix("dos.x"),
             "projwfc.x": with_prefix("projwfc.x"),
+            "sumpdos.x": with_prefix("sumpdos.x"),
             "fermi_velocity.x": with_prefix("fermi_velocity.x"),
             "pp.x": with_prefix("pp.x"),
             "thermo_pw.x": with_prefix("thermo_pw.x"),
