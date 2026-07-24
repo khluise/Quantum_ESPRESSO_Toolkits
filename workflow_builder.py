@@ -1615,6 +1615,7 @@ def render_phonon_input(
         ("outdir", qe_quote(outdir or "./out/")),
         ("fildyn", qe_quote(fildyn or "phonon.dyn")),
         ("trans", ".true." if trans else ".false."),
+        ("recover", ".true."),
         ("nmix_ph", str(max(1, int(nmix_ph or 4)))),
         ("verbosity", qe_quote(verbosity or "default")),
     ]

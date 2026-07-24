@@ -15741,7 +15741,7 @@ class MainUI(QMainWindow):
             "epsil": False,
             "trans": True,
             "lmultipole": False,
-            "recover": False,
+            "recover": True,
             "low_directory_check": False,
             "ldisp": False,
             "qplot": False,
@@ -15758,6 +15758,7 @@ class MainUI(QMainWindow):
             "nmix_ph": str(nmix_default_int),
             "verbosity": self._qe_quote(verbosity_default),
             "fildyn": self._qe_quote(fildyn_default),
+            "recover": ".true.",
         }
 
         if fildvscf_default:
