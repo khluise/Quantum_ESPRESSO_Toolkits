@@ -313,7 +313,7 @@ def apply_manual_ecutwfc_to_qe_text(text: str, options: Mapping[str, Any] | None
 def apply_2d_structure_options_to_qe_text(text: str, options: Mapping[str, Any] | None) -> str:
     if not isinstance(options, Mapping) or not _truthy_option(options.get("convert_2d_structure")):
         return text
-    return set_namelist_values(
+    updated = set_namelist_values(
         text,
         "system",
         {
@@ -321,6 +321,47 @@ def apply_2d_structure_options_to_qe_text(text: str, options: Mapping[str, Any] 
             "vdw_corr": qe_quote("Grimme-D3"),
         },
     )
+    return force_2d_k_points_automatic(updated)
+
+
+def force_2d_k_points_automatic(text: str, enabled: bool = True) -> str:
+    """Clamp the out-of-plane mesh of an automatic K_POINTS card to one.
+
+    Only an exact ``K_POINTS automatic`` mode is eligible.  Explicit crystal,
+    crystal_b, gamma, and malformed cards are intentionally left untouched.
+    """
+
+    if not enabled:
+        return text
+
+    lines = text.splitlines(keepends=True)
+    header_pattern = re.compile(
+        r"\s*K_POINTS(?:\s+automatic|\s*\{\s*automatic\s*\}|\s*\(\s*automatic\s*\))"
+        r"\s*(?:!.*)?",
+        re.IGNORECASE,
+    )
+    mesh_pattern = re.compile(
+        r"^(\s*[+-]?\d+\s+[+-]?\d+\s+)([+-]?\d+)"
+        r"(?=\s+[+-]?\d+\s+[+-]?\d+\s+[+-]?\d+\s*(?:!.*)?(?:\r?\n)?$)"
+    )
+
+    for header_index, line in enumerate(lines):
+        if header_pattern.fullmatch(line.rstrip("\r\n")) is None:
+            continue
+        for mesh_index in range(header_index + 1, len(lines)):
+            candidate = lines[mesh_index]
+            stripped = candidate.strip()
+            if not stripped or stripped.startswith("!"):
+                continue
+            match = mesh_pattern.match(candidate)
+            if match is None:
+                break
+            if int(match.group(2)) != 1:
+                start, end = match.span(2)
+                lines[mesh_index] = f"{candidate[:start]}1{candidate[end:]}"
+            break
+
+    return "".join(lines)
 
 
 def _generate_workflow_local(
@@ -1552,6 +1593,7 @@ def render_epc_scf_input(
     prefix: str,
     kmesh: Sequence[int],
     la2f: bool = False,
+    convert_2d_structure: bool = False,
     ecutwfc: int | float | None = None,
     spin_orbit_required: bool | None = None,
 ) -> str:
@@ -1579,6 +1621,8 @@ def render_epc_scf_input(
         rendered = set_namelist_values(rendered, "system", {"la2F": ".true."})
     else:
         rendered = remove_namelist_keys(rendered, "system", {"la2f"})
+    if convert_2d_structure:
+        rendered = remove_namelist_keys(rendered, "system", {"vdw_corr"})
     return rendered
 
 
@@ -1860,6 +1904,12 @@ def render_projwfc_input(
     outdir: str = "./out/",
     lsym: bool | None = None,
     filproj: str = "",
+    deltae: str | float | None = None,
+    kresolveddos: bool | None = None,
+    lbinary_data: bool | None = None,
+    lwrite_overlaps: bool | None = None,
+    plotboxes: bool | None = None,
+    tdosinboxes: bool | None = None,
 ) -> str:
     """Render a projwfc.x input file."""
 
@@ -1870,6 +1920,17 @@ def render_projwfc_input(
     ]
     if lsym is not None:
         lines.append(f"    lsym = {'.true.' if lsym else '.false.'}")
+    if deltae is not None:
+        lines.append(f"    deltae =   {deltae}")
+    for key, value in (
+        ("kresolveddos", kresolveddos),
+        ("lbinary_data", lbinary_data),
+        ("lwrite_overlaps", lwrite_overlaps),
+        ("plotboxes", plotboxes),
+        ("tdosinboxes", tdosinboxes),
+    ):
+        if value is not None:
+            lines.append(f"    {key} = {'.true.' if value else '.false.'}")
     if str(filproj or "").strip():
         lines.append(f"    filproj = {qe_quote(str(filproj).strip())}")
     lines.extend(["/", ""])
@@ -1984,6 +2045,92 @@ def manual_cutoff_skip_notice(ecutwfc: int | float) -> str:
     )
 
 
+def _split_qe_namelist_comment(line: str) -> tuple[str, str]:
+    """Split an inline QE comment without treating quoted ``!`` as a comment."""
+
+    quote = ""
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if quote:
+            if character == quote:
+                if index + 1 < len(line) and line[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = ""
+        elif character in {"'", '"'}:
+            quote = character
+        elif character == "!":
+            return line[:index], line[index:]
+        index += 1
+    return line, ""
+
+
+def _split_qe_namelist_fields(body: str) -> list[str]:
+    """Split comma-separated namelist assignments outside quotes/parentheses."""
+
+    fields: list[str] = []
+    quote = ""
+    parenthesis_depth = 0
+    start = 0
+    index = 0
+    while index < len(body):
+        character = body[index]
+        if quote:
+            if character == quote:
+                if index + 1 < len(body) and body[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = ""
+        elif character in {"'", '"'}:
+            quote = character
+        elif character == "(":
+            parenthesis_depth += 1
+        elif character == ")" and parenthesis_depth:
+            parenthesis_depth -= 1
+        elif character == "," and parenthesis_depth == 0:
+            fields.append(body[start:index])
+            start = index + 1
+        index += 1
+    fields.append(body[start:])
+    return fields
+
+
+def _qe_namelist_field_assignment(field: str) -> tuple[str, str] | None:
+    if "=" not in field:
+        return None
+    key, value = field.split("=", 1)
+    normalized_key = key.strip().lower()
+    if not re.fullmatch(r"[a-z_][a-z0-9_]*(?:\s*\([^=]*\))?", normalized_key):
+        return None
+    return normalized_key, value.strip()
+
+
+def _qe_namelist_assignment_groups(
+    fields: Sequence[str],
+) -> list[tuple[int, int, str, str]]:
+    """Group an assignment with following comma-delimited value continuations."""
+
+    groups: list[tuple[int, int, str, str]] = []
+    start: int | None = None
+    key = ""
+    value_parts: list[str] = []
+    for index, field in enumerate(fields):
+        assignment = _qe_namelist_field_assignment(field)
+        if assignment is None:
+            if start is not None:
+                value_parts.append(field.strip())
+            continue
+        if start is not None:
+            groups.append((start, index, key, ",".join(value_parts).rstrip(",")))
+        start = index
+        key, value = assignment
+        value_parts = [value]
+    if start is not None:
+        groups.append((start, len(fields), key, ",".join(value_parts).rstrip(",")))
+    return groups
+
+
 def remove_namelist_keys(text: str, namelist: str, keys: set[str]) -> str:
     lines = text.splitlines()
     start_idx, end_idx = find_namelist_bounds(lines, namelist)
@@ -1994,11 +2141,30 @@ def remove_namelist_keys(text: str, namelist: str, keys: set[str]) -> str:
     kept: list[str] = []
     for idx, line in enumerate(lines):
         if start_idx < idx < end_idx:
-            body = line.split("!", 1)[0]
-            if "=" in body:
-                key = body.split("=", 1)[0].strip().lower()
-                if key in lowered:
+            body, comment = _split_qe_namelist_comment(line)
+            fields = _split_qe_namelist_fields(body)
+            groups = _qe_namelist_assignment_groups(fields)
+            removed_indexes = {
+                field_index
+                for group_start, group_end, key, _value in groups
+                if key in lowered
+                for field_index in range(group_start, group_end)
+            }
+            filtered_fields = [
+                field for field_index, field in enumerate(fields)
+                if field_index not in removed_indexes
+            ]
+            if len(filtered_fields) != len(fields):
+                if not any(field.strip() for field in filtered_fields):
+                    if comment:
+                        indent = line[: len(line) - len(line.lstrip())]
+                        kept.append(f"{indent}{comment}")
                     continue
+                indent = body[: len(body) - len(body.lstrip())]
+                rebuilt = ",".join(filtered_fields)
+                if comment and rebuilt and not rebuilt[-1].isspace():
+                    rebuilt = f"{rebuilt} "
+                line = f"{indent}{rebuilt.lstrip()}{comment}"
         kept.append(line)
 
     suffix = "\n" if text.endswith("\n") else ""
@@ -2036,17 +2202,55 @@ def set_namelist_values(text: str, namelist: str, values: Mapping[str, str]) -> 
         return text
 
     indent = _namelist_assignment_indent(lines, start_idx + 1, end_idx)
-    remaining = {str(key).lower(): str(value) for key, value in values.items()}
+    requested = {str(key).lower(): str(value) for key, value in values.items()}
+    found: set[str] = set()
     for idx in range(start_idx + 1, end_idx):
-        body = lines[idx].split("!", 1)[0]
-        if "=" not in body:
+        body, comment = _split_qe_namelist_comment(lines[idx])
+        fields = _split_qe_namelist_fields(body)
+        groups = _qe_namelist_assignment_groups(fields)
+        matching = [group for group in groups if group[2] in requested]
+        if not matching:
             continue
-        key = body.split("=", 1)[0].strip().lower()
-        if key not in remaining:
-            continue
-        line_indent = lines[idx][: len(lines[idx]) - len(lines[idx].lstrip())] or indent
-        lines[idx] = f"{line_indent}{key} = {remaining.pop(key)}"
 
+        if len(groups) == 1 and len(matching) == 1:
+            key = matching[0][2]
+            line_indent = lines[idx][: len(lines[idx]) - len(lines[idx].lstrip())] or indent
+            rebuilt = f"{line_indent}{key} = {requested[key]}"
+            if comment:
+                rebuilt = f"{rebuilt} {comment}"
+            lines[idx] = rebuilt
+            found.add(key)
+            continue
+
+        rebuilt_fields: list[str] = []
+        groups_by_start = {group[0]: group for group in groups}
+        field_index = 0
+        while field_index < len(fields):
+            group = groups_by_start.get(field_index)
+            if group is None:
+                rebuilt_fields.append(fields[field_index])
+                field_index += 1
+                continue
+            group_start, group_end, key, _value = group
+            if key not in requested:
+                rebuilt_fields.extend(fields[group_start:group_end])
+                field_index = group_end
+                continue
+            field = fields[group_start]
+            field_indent = field[: len(field) - len(field.lstrip())] or " "
+            rebuilt_fields.append(f"{field_indent}{key} = {requested[key]}")
+            found.add(key)
+            field_index = group_end
+        rebuilt = ",".join(rebuilt_fields)
+        if comment and rebuilt and not rebuilt[-1].isspace():
+            rebuilt = f"{rebuilt} "
+        lines[idx] = f"{rebuilt}{comment}"
+
+    remaining = {
+        key: value
+        for key, value in requested.items()
+        if key not in found
+    }
     if remaining:
         insert_lines = [f"{indent}{key} = {value}" for key, value in remaining.items()]
         lines[end_idx:end_idx] = insert_lines
@@ -2063,11 +2267,10 @@ def parse_namelist_values(text: str, namelist: str) -> dict[str, str]:
 
     parsed: dict[str, str] = {}
     for idx in range(start_idx + 1, end_idx):
-        body = lines[idx].split("!", 1)[0]
-        if "=" not in body:
-            continue
-        key, value = body.split("=", 1)
-        parsed[key.strip().lower()] = value.strip().rstrip(",")
+        body, _comment = _split_qe_namelist_comment(lines[idx])
+        fields = _split_qe_namelist_fields(body)
+        for _start, _end, key, value in _qe_namelist_assignment_groups(fields):
+            parsed[key] = value
     return parsed
 
 
@@ -3601,6 +3804,10 @@ def normalize_wannier_options(options: Mapping[str, Any]) -> dict[str, Any]:
             if labels:
                 selected_paths.append(labels)
 
+    dis_num_iter = optional_int(raw, ["dis_num_iter"])
+    if dis_num_iter is None:
+        dis_num_iter = 0
+
     return {
         "kpoint_spacing": positive_float(raw, ["kpoint_spacing", "scf_kpoint_spacing"], 0.10),
         "scf_kmesh": scf_kmesh,
@@ -3611,8 +3818,8 @@ def normalize_wannier_options(options: Mapping[str, Any]) -> dict[str, Any]:
         "selected_paths": selected_paths,
         "kpoints_crystal_b": kpoints_crystal_b,
         "write_unk": _truthy_option(raw.get("write_unk", False)),
-        "num_iter": positive_int(raw, ["num_iter", "num_inter"], 500),
-        "dis_num_iter": positive_int(raw, ["dis_num_iter"], 500),
+        "num_iter": positive_int(raw, ["num_iter", "num_inter"], 10000),
+        "dis_num_iter": max(0, int(dis_num_iter)),
         "filband": str(raw.get("filband") or "bands.out"),
         "prefix": str(raw.get("prefix") or "").strip(),
     }

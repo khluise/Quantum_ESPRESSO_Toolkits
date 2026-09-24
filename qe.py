@@ -119,6 +119,7 @@ from workflow_builder import (
     _run_generator_command,
     copy_selected_workflow_pseudos,
     create_workflow_files,
+    force_2d_k_points_automatic,
     normalize_relaxation_parameters,
     normalize_qe_fortran_number,
     render_band_scf_input,
@@ -7489,11 +7490,11 @@ class MainUI(QMainWindow):
         self.workflowWannierWriteUnkCheckBox.setChecked(False)
         self.workflowWannierNumIterSpin = QSpinBox(control_group)
         self.workflowWannierNumIterSpin.setRange(1, 1000000)
-        self.workflowWannierNumIterSpin.setValue(500)
+        self.workflowWannierNumIterSpin.setValue(10000)
         self.workflowWannierNumIterSpin.setMaximumWidth(120)
         self.workflowWannierDisNumIterSpin = QSpinBox(control_group)
-        self.workflowWannierDisNumIterSpin.setRange(1, 1000000)
-        self.workflowWannierDisNumIterSpin.setValue(500)
+        self.workflowWannierDisNumIterSpin.setRange(0, 1000000)
+        self.workflowWannierDisNumIterSpin.setValue(0)
         self.workflowWannierDisNumIterSpin.setMaximumWidth(120)
         control_form.addRow("", self.workflowWannierWriteUnkCheckBox)
         control_form.addRow("num_iter:", self.workflowWannierNumIterSpin)
@@ -9085,6 +9086,10 @@ class MainUI(QMainWindow):
                     spin_orbit_required=spin_orbit,
                 )
                 rendered = set_namelist_values(rendered, "control", {"nstep": "0"})
+                rendered = force_2d_k_points_automatic(
+                    rendered,
+                    enabled=bool(conversion_options.get("convert_2d_structure")),
+                )
 
                 input_path = work_dir / "nbnd_dryrun_scf.in"
                 output_path = work_dir / "nbnd_dryrun_scf.out"
@@ -9095,13 +9100,24 @@ class MainUI(QMainWindow):
                 if output_path.is_file():
                     output_text = output_path.read_text(encoding="utf-8", errors="ignore")
 
-                nbnd = self._workflow_parse_nbnd_from_output(output_text)
+                if target_key == "wannier":
+                    nbnd = self._workflow_parse_wannier_nbnd_from_output(
+                        output_text,
+                        spin_orbit=spin_orbit,
+                    )
+                    missing_value = "'number of electrons'"
+                    multiplier = "3" if spin_orbit else "1.5"
+                    hint_text = f"Suggested nbnd from {multiplier} × electrons"
+                else:
+                    nbnd = self._workflow_parse_nbnd_from_output(output_text)
+                    missing_value = "'number of Kohn-Sham states'"
+                    hint_text = "Suggested nbnd from dry run"
                 if nbnd is None:
-                    raise RuntimeError("Could not find 'number of Kohn-Sham states' in dry-run output.")
+                    raise RuntimeError(f"Could not find {missing_value} in dry-run output.")
                 if isinstance(nbnd_widget, QLineEdit):
                     nbnd_widget.setText(str(int(nbnd)))
                 if isinstance(hint_widget, QLabel):
-                    hint_widget.setText(f"Suggested nbnd from dry run: {int(nbnd)}")
+                    hint_widget.setText(f"{hint_text}: {int(nbnd)}")
                 self.statusbar.showMessage(f"Suggested nbnd: {int(nbnd)}", 5000)
         except Exception as exc:  # noqa: BLE001
             self._show_error(f"nbnd dry run failed: {exc}")
@@ -9167,6 +9183,32 @@ class MainUI(QMainWindow):
             return int(matches[-1].group(1))
         except Exception:
             return None
+
+    @staticmethod
+    def _workflow_parse_wannier_nbnd_from_output(
+        text: str,
+        spin_orbit: bool = False,
+    ) -> Optional[int]:
+        matches = list(
+            re.finditer(
+                r"number\s+of\s+electrons\s*=\s*"
+                r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?)",
+                text or "",
+                re.IGNORECASE,
+            )
+        )
+        if not matches:
+            return None
+        try:
+            electron_count = float(
+                matches[-1].group(1).replace("D", "E").replace("d", "E")
+            )
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(electron_count) or electron_count <= 0:
+            return None
+        multiplier = 3.0 if spin_orbit else 1.5
+        return int(math.ceil(multiplier * electron_count))
 
     def _workflow_update_energy_delta_labels(self) -> None:
         if hasattr(self, "workflowEcutEnergyDeltaRyLabel"):
@@ -11155,12 +11197,12 @@ class MainUI(QMainWindow):
             "num_iter": (
                 int(self.workflowWannierNumIterSpin.value())
                 if hasattr(self, "workflowWannierNumIterSpin")
-                else 500
+                else 10000
             ),
             "dis_num_iter": (
                 int(self.workflowWannierDisNumIterSpin.value())
                 if hasattr(self, "workflowWannierDisNumIterSpin")
-                else 500
+                else 0
             ),
             "filband": "bands.out",
         }
@@ -12345,6 +12387,7 @@ class MainUI(QMainWindow):
                 "prepare_source",
                 source_task,
                 item_by_key,
+                state=state,
                 job_index=job_index,
                 job_tone=job_tone,
             )
@@ -12376,6 +12419,7 @@ class MainUI(QMainWindow):
                     task_id,
                     task,
                     item_by_key,
+                    state=state,
                     direct=True,
                     job_index=job_index,
                     job_tone=job_tone,
@@ -12424,6 +12468,7 @@ class MainUI(QMainWindow):
                     task_id,
                     task,
                     item_by_key,
+                    state=state,
                     job_index=job_index,
                     job_tone=job_tone,
                 )
@@ -12455,6 +12500,7 @@ class MainUI(QMainWindow):
                     task_id,
                     task,
                     item_by_key,
+                    state=state,
                     job_index=job_index,
                     job_tone=job_tone,
                 )
@@ -12486,6 +12532,7 @@ class MainUI(QMainWindow):
                     task_id,
                     task,
                     item_by_key,
+                    state=state,
                     job_index=job_index,
                     job_tone=job_tone,
                 )
@@ -12521,6 +12568,7 @@ class MainUI(QMainWindow):
                     task_id,
                     task,
                     item_by_key,
+                    state=state,
                     job_index=job_index,
                     job_tone=job_tone,
                 )
@@ -12556,6 +12604,7 @@ class MainUI(QMainWindow):
                     task_id,
                     task,
                     item_by_key,
+                    state=state,
                     job_index=job_index,
                     job_tone=job_tone,
                 )
@@ -12587,6 +12636,7 @@ class MainUI(QMainWindow):
                     task_id,
                     task,
                     item_by_key,
+                    state=state,
                     job_index=job_index,
                     job_tone=job_tone,
                 )
@@ -12618,6 +12668,7 @@ class MainUI(QMainWindow):
                     task_id,
                     task,
                     item_by_key,
+                    state=state,
                     job_index=job_index,
                     job_tone=job_tone,
                 )
@@ -12649,6 +12700,7 @@ class MainUI(QMainWindow):
                     task_id,
                     task,
                     item_by_key,
+                    state=state,
                     job_index=job_index,
                     job_tone=job_tone,
                 )
@@ -12688,6 +12740,7 @@ class MainUI(QMainWindow):
                     task_id,
                     task,
                     item_by_key,
+                    state=state,
                     direct=True,
                     job_index=job_index,
                     job_tone=job_tone,
@@ -12700,6 +12753,7 @@ class MainUI(QMainWindow):
         task: Dict[str, Any],
         item_by_key: Dict[str, QTreeWidgetItem],
         *,
+        state: Dict[str, Any],
         direct: bool = False,
         job_index: int,
         job_tone: int,
@@ -12733,6 +12787,7 @@ class MainUI(QMainWindow):
         for index, child in enumerate(children):
             child_id = str(child.get("id") or index)
             key = f"{root_key}:child:{task_id}:{child_id}"
+            start_time, finish_time = self._workflow_child_timestamps(state, task_id, task, child)
             item = self._workflow_tree_item(
                 self._workflow_child_display_label(task_id, task, child),
                 self._workflow_child_status(task, child),
@@ -12743,10 +12798,105 @@ class MainUI(QMainWindow):
                     "job_tone": job_tone,
                     "task_id": task_id,
                     "child_id": child_id,
+                    "start_time": start_time,
+                    "finish_time": finish_time,
                 },
             )
             parent.addChild(item)
             item_by_key[key] = item
+
+    def _workflow_child_timestamps(
+        self,
+        state: Dict[str, Any],
+        task_id: str,
+        task: Dict[str, Any],
+        child: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """Return display-ready start and finish times for one workflow child."""
+        status = self._workflow_child_status(task, child)
+        if status in {"queued", "waiting"}:
+            return "", ""
+
+        start_value = next(
+            (child.get(key) for key in ("started_at", "start_time") if child.get(key)),
+            None,
+        )
+        finish_value = next(
+            (
+                child.get(key)
+                for key in (
+                    "finished_at",
+                    "finish_time",
+                    "ended_at",
+                    "completed_at",
+                    "failed_at",
+                    "stopped_at",
+                )
+                if child.get(key)
+            ),
+            None,
+        )
+
+        exact_event_start: Any = None
+        exact_event_finish: Any = None
+        fallback_event_start: Any = None
+        fallback_event_finish: Any = None
+        child_id = str(child.get("id") or "")
+        task_children = [entry for entry in (task.get("children") or []) if isinstance(entry, dict)]
+        events = state.get("events") if isinstance(state.get("events"), list) else []
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if str(payload.get("task") or "") != str(task_id):
+                continue
+
+            event_child_id = str(payload.get("child") or "")
+            if event_child_id:
+                if event_child_id != child_id:
+                    continue
+                exact_child_match = True
+            elif len(task_children) != 1:
+                continue
+            else:
+                exact_child_match = False
+
+            event_kind = str(event.get("type") or "").strip().lower().rsplit(".", 1)[-1]
+            event_time = event.get("time") or event.get("timestamp")
+            is_start_event = event_kind in {"started", "starting"}
+            is_finish_event = event_kind in {
+                "canceled",
+                "cancelled",
+                "completed",
+                "finished",
+                "failed",
+                "stopped",
+                "continued",
+                "warning",
+                "skipped",
+                "terminated",
+            }
+            if exact_child_match:
+                if is_start_event and exact_event_start is None:
+                    exact_event_start = event_time
+                elif is_finish_event and exact_event_finish is None:
+                    exact_event_finish = event_time
+            else:
+                if is_start_event and fallback_event_start is None:
+                    fallback_event_start = event_time
+                elif is_finish_event and fallback_event_finish is None:
+                    fallback_event_finish = event_time
+            if exact_event_start is not None and exact_event_finish is not None:
+                break
+
+        event_start = exact_event_start or fallback_event_start
+        event_finish = exact_event_finish or fallback_event_finish
+        start_time = self._format_job_timestamp(start_value or event_start)
+        if status in {"running", "retrying"}:
+            finish_time = ""
+        else:
+            finish_time = self._format_job_timestamp(finish_value or event_finish)
+        return start_time, finish_time
 
     def _workflow_child_display_label(self, task_id: str, task: Dict[str, Any], child: Dict[str, Any]) -> str:
         child_id = str(child.get("id") or "")
@@ -12860,6 +13010,10 @@ class MainUI(QMainWindow):
         text = f"{label} | {status_text}"
         if progress:
             text = f"{text} | {progress}"
+        if str(data.get("kind") or "") == "child":
+            start_time = str(data.get("start_time") or "-")
+            finish_time = str(data.get("finish_time") or "-")
+            text = f"{text} | Start: {start_time} | Finish: {finish_time}"
         item = QTreeWidgetItem([text])
         item_data = dict(data)
         item_data.setdefault("label", label)
@@ -13241,10 +13395,13 @@ class MainUI(QMainWindow):
         child: Dict[str, Any],
     ) -> List[str]:
         label = self._workflow_child_display_label(task_id, task, child)
+        start_time, finish_time = self._workflow_child_timestamps(state, task_id, task, child)
         lines = [
             f"Workflow child: {label}",
             f"Task: {task.get('label', task_id)}",
             f"Status: {self._workflow_child_status(task, child)}",
+            f"Start time: {start_time or '-'}",
+            f"Finish time: {finish_time or '-'}",
             f"Workflow state: {state_path or '<unset>'}",
             f"Workdir: {self._workflow_abs_path(root, child.get('workdir')) or '<unset>'}",
             f"Input: {self._workflow_abs_path(root, child.get('input')) or '<unset>'}",

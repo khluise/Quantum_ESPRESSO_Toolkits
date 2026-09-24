@@ -19,7 +19,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from analyze_wannier_windows import analyze_windows
 from workflow_builder import (
     _generate_workflow_qe_input,
     _finalize_prepared_qe_template,
@@ -44,6 +43,7 @@ from workflow_builder import (
     extract_last_qe_card,
     extract_relaxed_structure_from_pw_output,
     extract_relaxed_structure_from_qe_xml,
+    force_2d_k_points_automatic,
     kmesh_from_qe_input,
     manual_ecutwfc_from_options,
     parse_namelist_values,
@@ -72,6 +72,7 @@ from workflow_builder import (
     render_qe_input_with_structure,
     render_tetra_scf_input,
     render_thermo_control,
+    remove_namelist_keys,
     replace_qe_card,
     sanitize_job_name,
     set_namelist_values,
@@ -83,6 +84,7 @@ from qe_helper.kpoints import generate_crystal_kmesh
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 COMMAND_PREFS_PATH = PROJECT_ROOT / "command_preferences.json"
+DEFAULT_QE_ETOT_CONV_THR = "1.0D-4"
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 
@@ -423,7 +425,7 @@ def run_initial_relaxation(manifest: Mapping[str, Any], state: dict[str, Any], s
             conversion_options=manifest.get("conversion") or {},
             relaxation_options=relaxation_parameters_for_child(manifest, child),
         )
-        input_path.write_text(rendered, encoding="utf-8")
+        rendered = write_workflow_input(input_path, rendered, manifest)
         append_log(child_log_path, f"Wrote initial relaxation input: {input_path}\n")
 
         command = build_pw_command(input_path.name, output_path.name)
@@ -984,6 +986,7 @@ def run_phonon_workflow_child(
                 prefix=prefix,
                 kmesh=phonon_options.get("epc_fit_kmesh") or [24, 24, 24],
                 la2f=True,
+                convert_2d_structure=workflow_convert_2d_structure_enabled(manifest),
                 ecutwfc=optional_float_or_none(ecutwfc),
                 spin_orbit_required=spin_orbit,
             )
@@ -996,6 +999,7 @@ def run_phonon_workflow_child(
                 prefix=prefix,
                 kmesh=phonon_options.get("epc_scf_kmesh") or [12, 12, 12],
                 la2f=False,
+                convert_2d_structure=workflow_convert_2d_structure_enabled(manifest),
                 ecutwfc=optional_float_or_none(ecutwfc),
                 spin_orbit_required=spin_orbit,
             )
@@ -1218,8 +1222,14 @@ def run_phonon_workflow_child(
         else:
             raise RuntimeError(f"Unsupported phonon workflow child stage: {stage}")
 
+        if (
+            workflow_convert_2d_structure_enabled(manifest)
+            and stage in {"scf", "epc_fit_scf", "epc_scf"}
+        ):
+            rendered = remove_namelist_keys(rendered, "system", {"vdw_corr"})
+
         if not handled_execution:
-            input_path.write_text(rendered, encoding="utf-8")
+            rendered = write_workflow_input(input_path, rendered, manifest)
             append_log(child_log_path, f"Wrote {task_id} {stage} input: {input_path}\n")
             command = (
                 build_qe_stdin_command(engine, input_path.name, output_path.name)
@@ -3931,15 +3941,14 @@ def run_wannier90_workflow_task(
     if len(kpoints_crystal_b) < 2:
         raise RuntimeError(f"{task_id} is missing K_POINTS crystal_b data.")
 
-    wannier_nbnd = optional_positive_int(
-        merged_options.get("wannier_nbnd")
-        or merged_options.get("nband")
-        or merged_options.get("nbnd")
-    ) or 64
     filband = str(merged_options.get("filband") or "bands.out")
     write_unk = truthy_runtime_option(merged_options.get("write_unk", False))
-    win_num_iter = optional_positive_int(merged_options.get("num_iter") or merged_options.get("num_inter")) or 500
-    win_dis_num_iter = optional_positive_int(merged_options.get("dis_num_iter")) or 500
+    win_num_iter = optional_positive_int(
+        merged_options.get("num_iter") or merged_options.get("num_inter")
+    ) or 10000
+    win_dis_num_iter = optional_nonnegative_int(merged_options.get("dis_num_iter"))
+    if win_dis_num_iter is None:
+        win_dis_num_iter = 0
     prefix = wannier90_workflow_prefix(manifest, merged_options)
     filproj = str(merged_options.get("filproj") or f"{prefix}.proj").strip() or f"{prefix}.proj"
     outdir = "./out/"
@@ -3979,8 +3988,6 @@ def run_wannier90_workflow_task(
                 kpoint_spacing=kpoint_spacing,
                 scf_kmesh=wannier_scf_kmesh,
                 kpoints_crystal_b=kpoints_crystal_b,
-                nbnd=wannier_nbnd,
-                wannier_nbnd=wannier_nbnd,
                 write_unk=write_unk,
                 win_num_iter=win_num_iter,
                 win_dis_num_iter=win_dis_num_iter,
@@ -3991,6 +3998,14 @@ def run_wannier90_workflow_task(
                 state_path=state_path,
             )
 
+        derived_nbnd = resolve_wannier90_nbnd(
+            workflow_root,
+            task,
+            spin_orbit=spin_orbit,
+        )
+        number_of_electrons = resolve_wannier90_number_of_electrons(workflow_root, task)
+        natomwfc = resolve_wannier90_natomwfc(workflow_root, task)
+
         task["status"] = "completed"
         task["completed"] = count_completed_children(task)
         task["planned_total"] = len(children)
@@ -4000,8 +4015,10 @@ def run_wannier90_workflow_task(
             "outdir": outdir,
             "kpoint_spacing": kpoint_spacing,
             "scf_kmesh": wannier_scf_kmesh,
-            "nbnd": wannier_nbnd,
-            "wannier_nbnd": wannier_nbnd,
+            "nbnd": derived_nbnd,
+            "wannier_nbnd": derived_nbnd,
+            "number_of_electrons": number_of_electrons,
+            "natomwfc": natomwfc,
             "kpoints_crystal_b": kpoints_crystal_b,
             "filband": filband,
             "filproj": filproj,
@@ -4043,8 +4060,6 @@ def run_wannier90_workflow_child(
     kpoint_spacing: float,
     scf_kmesh: Sequence[int] | None,
     kpoints_crystal_b: Sequence[str],
-    nbnd: int | None,
-    wannier_nbnd: int,
     write_unk: bool,
     win_num_iter: int,
     win_dis_num_iter: int,
@@ -4079,6 +4094,9 @@ def run_wannier90_workflow_child(
         nscf_kmesh: list[int] | None = None
         nscf_kpoint_count: int | None = None
         filproj_relative: str | None = None
+        effective_nbnd: int | None = None
+        number_of_electrons: float | None = None
+        natomwfc: int | None = None
         if stage in {"wannier90_preprocess", "wannier_preprocess", "win_pp"}:
             command = build_wannier90_preprocess_command("wannier_control.win")
             run_wannier90_command_child(
@@ -4143,9 +4161,7 @@ def run_wannier90_workflow_child(
                 task=task,
                 base_text=base_text,
                 kpoints_crystal_b=kpoints_crystal_b,
-                nbnd=wannier_nbnd,
                 nscf_kmesh=wannier90_nscf_kmesh(task, base_text),
-                filband=filband,
                 log_path=child_log_path,
                 spin_orbit=spin_orbit,
                 num_iter=win_num_iter,
@@ -4166,7 +4182,9 @@ def run_wannier90_workflow_child(
             results = state.setdefault("results", {})
             results[f"{task_id}_{stage}_output"] = child.get("output")
             results["wannier90_win_input"] = child.get("output")
-            results["wannier90_win_fermi_ev"] = win_outputs.get("fermi_ev")
+            results["wannier90_win_num_bands"] = win_outputs.get("num_bands")
+            results["wannier90_win_num_wann"] = win_outputs.get("num_wann")
+            results["wannier90_win_conv_tol"] = win_outputs.get("conv_tol")
             results["wannier90_win_mp_grid"] = win_outputs.get("mp_grid")
             state["updated_at"] = timestamp()
             add_event(state, "child.completed", {"task": task_id, "child": child.get("id"), "stage": stage})
@@ -4313,7 +4331,16 @@ def run_wannier90_workflow_child(
                 spin_orbit_required=spin_orbit,
                 outdir=outdir,
             )
-            rendered = set_namelist_values(rendered, "system", {"nbnd": str(int(wannier_nbnd))})
+            if not str(
+                parse_namelist_values(rendered, "control").get("etot_conv_thr")
+                or ""
+            ).strip():
+                rendered = set_namelist_values(
+                    rendered,
+                    "control",
+                    {"etot_conv_thr": DEFAULT_QE_ETOT_CONV_THR},
+                )
+            rendered = remove_namelist_keys(rendered, "system", {"nbnd"})
             if spin_orbit:
                 rendered = set_namelist_values(
                     rendered,
@@ -4322,17 +4349,32 @@ def run_wannier90_workflow_child(
                 )
             engine = "pw.x"
         elif stage in {"pwbands", "bands"}:
+            number_of_electrons = resolve_wannier90_number_of_electrons(
+                workflow_root,
+                task,
+            )
+            effective_nbnd = wannier90_nbnd_from_electron_count(
+                number_of_electrons,
+                spin_orbit=spin_orbit,
+            )
             rendered = render_band_calculation_input(
                 base_text,
                 workflow_root=workflow_root,
                 child_workdir=child.get("workdir") or WANNIER90_DIR,
                 prefix=prefix,
                 kpoints_crystal_b=kpoints_crystal_b,
-                nbnd=nbnd,
+                nbnd=effective_nbnd,
                 ecutwfc=optional_float_or_none(ecutwfc),
                 spin_orbit_required=spin_orbit,
             )
-            rendered = set_namelist_values(rendered, "electrons", {"diago_full_acc": ".true."})
+            rendered = set_namelist_values(
+                rendered,
+                "electrons",
+                {
+                    "diago_full_acc": ".true.",
+                    "diagonalization": "'cg'",
+                },
+            )
             if spin_orbit:
                 rendered = set_namelist_values(
                     rendered,
@@ -4348,6 +4390,14 @@ def run_wannier90_workflow_child(
             )
             engine = "bands.x"
         elif stage == "nscf":
+            number_of_electrons = resolve_wannier90_number_of_electrons(
+                workflow_root,
+                task,
+            )
+            effective_nbnd = wannier90_nbnd_from_electron_count(
+                number_of_electrons,
+                spin_orbit=spin_orbit,
+            )
             rendered, nscf_kmesh, nscf_kpoint_count = render_wannier90_nscf_input(
                 base_text,
                 workflow_root=workflow_root,
@@ -4359,7 +4409,16 @@ def run_wannier90_workflow_child(
                 spin_orbit_required=spin_orbit,
                 outdir=outdir,
             )
-            rendered = set_namelist_values(rendered, "system", {"nbnd": str(int(wannier_nbnd))})
+            rendered = set_namelist_values(
+                rendered,
+                "system",
+                {"nbnd": str(effective_nbnd), "nosym": ".true."},
+            )
+            rendered = set_namelist_values(
+                rendered,
+                "electrons",
+                {"diagonalization": "'cg'"},
+            )
             if spin_orbit:
                 rendered = set_namelist_values(
                     rendered,
@@ -4371,20 +4430,41 @@ def run_wannier90_workflow_child(
             rendered = render_projwfc_input(
                 prefix=prefix,
                 outdir=outdir,
-                lsym=False,
+                lsym=True,
                 filproj=filproj,
+                deltae="2.0000000000d-01",
+                kresolveddos=False,
+                lbinary_data=False,
+                lwrite_overlaps=False,
+                plotboxes=False,
+                tdosinboxes=False,
             )
             filproj_relative = str((Path(str(child.get("workdir") or WANNIER90_DIR)) / filproj).as_posix())
             engine = "projwfc.x"
         else:
             raise RuntimeError(f"Unsupported Wannier90 + SCDM workflow child stage: {stage}")
 
-        input_path.write_text(rendered, encoding="utf-8")
+        rendered = write_workflow_input(input_path, rendered, manifest)
         append_log(child_log_path, f"Wrote {task_id} {stage} input: {input_path}\n")
 
         command = build_qe_command(engine, input_path.name, output_path.name)
         append_log(child_log_path, f"Running in {child_workdir}: {command}\n")
         run_shell_command(command, cwd=child_workdir, log_path=child_log_path)
+
+        output_text = (
+            output_path.read_text(encoding="utf-8", errors="ignore")
+            if output_path.is_file()
+            else ""
+        )
+        if stage == "scf":
+            number_of_electrons = extract_number_of_electrons(output_text)
+        elif stage == "projwfc":
+            natomwfc = extract_natomwfc(output_text)
+            if natomwfc is None:
+                raise RuntimeError(
+                    f"Could not find a positive 'natomwfc =' value in Wannier90 "
+                    f"projwfc output: {output_path}"
+                )
 
         archive_child_files(workflow_root, child)
         child["status"] = "completed"
@@ -4401,6 +4481,12 @@ def run_wannier90_workflow_child(
             child_result["kpoints"] = nscf_kpoint_count
         if filproj_relative is not None:
             child_result["filproj"] = filproj_relative
+        if effective_nbnd is not None:
+            child_result["nbnd"] = effective_nbnd
+        if number_of_electrons is not None:
+            child_result["number_of_electrons"] = number_of_electrons
+        if natomwfc is not None:
+            child_result["natomwfc"] = natomwfc
         child["result"] = child_result
         task["completed"] = count_completed_children(task)
         task["running_child"] = None
@@ -4736,23 +4822,21 @@ def write_wannier90_win_input(
     task: Mapping[str, Any],
     base_text: str,
     kpoints_crystal_b: Sequence[str],
-    nbnd: int,
     nscf_kmesh: Sequence[int] | None,
-    filband: str,
     log_path: Path,
     spin_orbit: bool,
     num_iter: int,
     dis_num_iter: int,
-    fermi_ev: float | None = None,
-    bands_gnu_path: Path | None = None,
 ) -> dict[str, Any]:
     """Render wannier_control.win for the Wannier90 + SCDM workflow."""
 
-    fermi = optional_float_or_none(fermi_ev)
-    if fermi is None:
-        fermi = resolve_wannier90_fermi_ev(workflow_root, task)
-    if fermi is None:
-        raise RuntimeError("Could not determine Fermi energy for wannier_control.win from Wannier90 SCF output.")
+    nbnd = resolve_wannier90_nbnd(
+        workflow_root,
+        task,
+        spin_orbit=spin_orbit,
+    )
+    num_wann = resolve_wannier90_natomwfc(workflow_root, task)
+    conv_tol = resolve_wannier90_conv_tol(workflow_root, task)
 
     kmesh = [int(value) for value in (nscf_kmesh or [])[:3]]
     if len(kmesh) < 3:
@@ -4762,21 +4846,12 @@ def write_wannier90_win_input(
     if len(kmesh) < 3:
         raise RuntimeError("Could not determine NSCF kmesh for wannier_control.win mp_grid.")
 
-    gnu_path = bands_gnu_path or resolve_band_gnu_path(workflow_root, task, filband)
-    if gnu_path is None or not gnu_path.is_file():
-        raise FileNotFoundError(f"Wannier90 band data file is missing: expected {filband}.gnu")
-    window_analysis = analyze_windows(gnu_path, float(fermi), tolerance=2.0)
-
     rendered = render_wannier90_win_input(
         base_text=base_text,
         kpoints_crystal_b=kpoints_crystal_b,
-        nbnd=int(nbnd),
-        num_wann=int(window_analysis.num_wann),
-        dis_froz_min=float(window_analysis.dis_froz_min),
-        dis_froz_max=float(window_analysis.dis_froz_max),
-        dis_win_min=float(window_analysis.dis_win_min),
-        dis_win_max=float(window_analysis.dis_win_max),
-        fermi_ev=float(fermi),
+        nbnd=nbnd,
+        num_wann=num_wann,
+        conv_tol=conv_tol,
         mp_grid=kmesh,
         spin_orbit=spin_orbit,
         num_iter=num_iter,
@@ -4787,23 +4862,167 @@ def write_wannier90_win_input(
     append_log(
         log_path,
         f"Saved Wannier90 control input: {output_path} "
-        f"(num_bands={int(nbnd)}, num_wann={int(window_analysis.num_wann)}, "
-        f"fermi_ev={float(fermi):.6f}, mp_grid={kmesh[0]} {kmesh[1]} {kmesh[2]})\n",
+        f"(num_bands={nbnd}, num_wann={num_wann}, conv_tol={conv_tol}, "
+        f"mp_grid={kmesh[0]} {kmesh[1]} {kmesh[2]})\n",
     )
     return {
-        "num_bands": int(nbnd),
-        "num_wann": int(window_analysis.num_wann),
-        "fermi_ev": float(fermi),
-        "bands_gnu": str(gnu_path),
-        "dis_froz_min": float(window_analysis.dis_froz_min),
-        "dis_froz_max": float(window_analysis.dis_froz_max),
-        "dis_win_min": float(window_analysis.dis_win_min),
-        "dis_win_max": float(window_analysis.dis_win_max),
+        "num_bands": nbnd,
+        "num_wann": num_wann,
+        "conv_tol": conv_tol,
         "mp_grid": kmesh,
         "kpoints": int(kmesh[0]) * int(kmesh[1]) * int(kmesh[2]),
         "num_iter": int(num_iter),
         "dis_num_iter": int(dis_num_iter),
     }
+
+
+def extract_number_of_electrons(text: str) -> float | None:
+    matches = list(
+        re.finditer(
+            r"number\s+of\s+electrons\s*=\s*"
+            r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?)",
+            text or "",
+            re.IGNORECASE,
+        )
+    )
+    if not matches:
+        return None
+    try:
+        value = float(matches[-1].group(1).replace("D", "E").replace("d", "E"))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def wannier90_nbnd_from_electron_count(
+    value: float,
+    spin_orbit: bool = False,
+) -> int:
+    try:
+        electron_count = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Wannier90 electron count must be a positive finite number.") from exc
+    if not math.isfinite(electron_count) or electron_count <= 0:
+        raise ValueError("Wannier90 electron count must be a positive finite number.")
+    multiplier = 3.0 if spin_orbit else 1.5
+    return int(math.ceil(multiplier * electron_count))
+
+
+def extract_natomwfc(text: str) -> int | None:
+    matches = list(re.finditer(r"\bnatomwfc\s*=\s*(\d+)", text or "", re.IGNORECASE))
+    if not matches:
+        return None
+    try:
+        value = int(matches[-1].group(1))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def resolve_wannier90_number_of_electrons(
+    workflow_root: Path,
+    task: Mapping[str, Any],
+) -> float:
+    scf_output = band_child_output_path(workflow_root, task, stage="scf")
+    if scf_output is None:
+        scf_output = workflow_root / WANNIER90_DIR / "scf.out"
+    if not scf_output.is_file():
+        raise FileNotFoundError(f"Wannier90 SCF output is missing: {scf_output}")
+    value = extract_number_of_electrons(
+        scf_output.read_text(encoding="utf-8", errors="ignore")
+    )
+    if value is None:
+        raise RuntimeError(
+            f"Could not find a positive 'number of electrons =' value in "
+            f"Wannier90 SCF output: {scf_output}"
+        )
+    return value
+
+
+def resolve_wannier90_nbnd(
+    workflow_root: Path,
+    task: Mapping[str, Any],
+    *,
+    spin_orbit: bool = False,
+) -> int:
+    expected_nbnd = wannier90_nbnd_from_electron_count(
+        resolve_wannier90_number_of_electrons(workflow_root, task),
+        spin_orbit=spin_orbit,
+    )
+    mismatches: list[tuple[str, int]] = []
+    for stage in ("pwbands", "bands", "nscf"):
+        child = band_child_by_stage(task, stage=stage)
+        if not isinstance(child, Mapping):
+            continue
+        if str(child.get("status") or "").strip().lower() != "completed":
+            continue
+
+        actual_nbnd: int | None = None
+        input_path = band_child_input_path(workflow_root, task, stage=stage)
+        if input_path is not None and input_path.is_file():
+            actual_nbnd = optional_positive_int(
+                parse_namelist_values(
+                    input_path.read_text(encoding="utf-8", errors="ignore"),
+                    "system",
+                ).get("nbnd")
+            )
+        if actual_nbnd is None:
+            result = child.get("result") if isinstance(child.get("result"), Mapping) else {}
+            actual_nbnd = optional_positive_int(result.get("nbnd"))
+        if actual_nbnd is not None and actual_nbnd != expected_nbnd:
+            mismatches.append((stage, actual_nbnd))
+
+    if mismatches:
+        details = ", ".join(f"{stage}={value}" for stage, value in mismatches)
+        raise RuntimeError(
+            "Completed Wannier90 child inputs use stale nbnd values "
+            f"({details}); expected {expected_nbnd} from the SCF electron count"
+            f"{' with spin-orbit coupling' if spin_orbit else ''}. "
+            "Reset the listed child stages to queued and rerun the workflow."
+        )
+    return expected_nbnd
+
+
+def resolve_wannier90_natomwfc(workflow_root: Path, task: Mapping[str, Any]) -> int:
+    projwfc_output = band_child_output_path(workflow_root, task, stage="projwfc")
+    if projwfc_output is None:
+        projwfc_output = workflow_root / WANNIER90_DIR / "projwfc.out"
+    if not projwfc_output.is_file():
+        raise FileNotFoundError(f"Wannier90 projwfc output is missing: {projwfc_output}")
+    value = extract_natomwfc(
+        projwfc_output.read_text(encoding="utf-8", errors="ignore")
+    )
+    if value is None:
+        raise RuntimeError(
+            f"Could not find a positive 'natomwfc =' value in Wannier90 "
+            f"projwfc output: {projwfc_output}"
+        )
+    return value
+
+
+def resolve_wannier90_conv_tol(workflow_root: Path, task: Mapping[str, Any]) -> str:
+    scf_input = band_child_input_path(workflow_root, task, stage="scf")
+    if scf_input is None:
+        scf_input = workflow_root / WANNIER90_DIR / "scf.in"
+    if not scf_input.is_file():
+        raise FileNotFoundError(f"Wannier90 SCF input is missing: {scf_input}")
+    value = parse_namelist_values(
+        scf_input.read_text(encoding="utf-8", errors="ignore"),
+        "control",
+    ).get("etot_conv_thr", "").strip()
+    if not value:
+        # Older/imported SCF inputs may rely on QE's documented effective default.
+        value = DEFAULT_QE_ETOT_CONV_THR
+    try:
+        numeric_value = float(value.replace("D", "E").replace("d", "E"))
+    except (TypeError, ValueError):
+        numeric_value = float("nan")
+    if not math.isfinite(numeric_value) or numeric_value <= 0:
+        raise RuntimeError(
+            f"Could not find a positive '&CONTROL etot_conv_thr' value in "
+            f"Wannier90 SCF input: {scf_input}"
+        )
+    return value
 
 
 def resolve_wannier90_fermi_ev(workflow_root: Path, task: Mapping[str, Any]) -> float | None:
@@ -4839,18 +5058,13 @@ def render_wannier90_win_input(
     kpoints_crystal_b: Sequence[str],
     nbnd: int,
     num_wann: int,
-    dis_froz_min: float,
-    dis_froz_max: float,
-    dis_win_min: float,
-    dis_win_max: float,
-    fermi_ev: float,
+    conv_tol: str,
     mp_grid: Sequence[int],
     spin_orbit: bool = False,
-    num_iter: int = 500,
-    dis_num_iter: int = 500,
+    num_iter: int = 10000,
+    dis_num_iter: int = 0,
 ) -> str:
     nk1, nk2, nk3 = [int(value) for value in mp_grid[:3]]
-    _ = fermi_ev
     cell_rows = wannier90_cell_rows_from_qe_input(base_text)
     atom_rows = wannier90_atom_frac_rows_from_qe_input(base_text, cell_rows)
     path_rows = wannier90_kpoint_path_rows(kpoints_crystal_b)
@@ -4860,11 +5074,13 @@ def render_wannier90_win_input(
         f"num_bands       = {int(nbnd)}",
         f"num_wann        = {int(num_wann)}",
         f"num_iter        = {int(num_iter)}",
-        f"dis_win_max     = {format_window_float(dis_win_max)}",
-        f"dis_win_min     = {format_window_float(dis_win_min)}",
-        f"dis_froz_max    = {format_window_float(dis_froz_max)}",
-        f"dis_froz_min    = {format_window_float(dis_froz_min)}",
         f"dis_num_iter = {int(dis_num_iter)}",
+        f"conv_tol = {conv_tol}",
+        "conv_window = 3",
+        "kmesh_tol = 1.0000000000d-05",
+        "use_ws_distance = .true.",
+        "wannier_plot = .false.",
+        "write_xyz = .true.",
         "iprint = 3",
         "",
         "! Crucial for generating the hr.dat file",
@@ -5233,7 +5449,7 @@ def run_dos_workflow_child(
         else:
             raise RuntimeError(f"Unsupported DOS workflow child stage: {stage}")
 
-        input_path.write_text(rendered, encoding="utf-8")
+        rendered = write_workflow_input(input_path, rendered, manifest)
         append_log(child_log_path, f"Wrote {task_id} {stage} input: {input_path}\n")
         command = build_qe_command(engine, input_path.name, output_path.name)
         append_log(child_log_path, f"Running in {child_workdir}: {command}\n")
@@ -5424,7 +5640,7 @@ def run_fermi_surface_workflow_child(
                 spin_orbit_required=spin_orbit,
                 outdir=outdir,
             )
-            input_path.write_text(rendered, encoding="utf-8")
+            rendered = write_workflow_input(input_path, rendered, manifest)
             append_log(child_log_path, f"Wrote {task_id} {stage} input: {input_path}\n")
             engine = "pw.x"
         elif stage == "fermi_velocity":
@@ -5691,7 +5907,7 @@ def run_charge_density_workflow_child(
         else:
             raise RuntimeError(f"Unsupported charge-density workflow child stage: {stage}")
 
-        input_path.write_text(rendered, encoding="utf-8")
+        rendered = write_workflow_input(input_path, rendered, manifest)
         append_log(child_log_path, f"Wrote {task_id} {stage} input: {input_path}\n")
         command = build_qe_command(engine, input_path.name, output_path.name)
         append_log(child_log_path, f"Running in {child_workdir}: {command}\n")
@@ -5832,7 +6048,7 @@ def run_elastic_workflow_task(
             ecutwfc=optional_float_or_none(ecutwfc),
             spin_orbit_required=spin_orbit,
         )
-        input_path.write_text(rendered_scf, encoding="utf-8")
+        rendered_scf = write_workflow_input(input_path, rendered_scf, manifest)
         control_path.write_text(render_thermo_control(elastic_options), encoding="utf-8")
         append_log(child_log_path, f"Wrote elastic SCF input: {input_path}\n")
         append_log(child_log_path, f"Wrote thermo_pw control file: {control_path}\n")
@@ -7918,7 +8134,7 @@ def run_band_workflow_child(
         else:
             raise RuntimeError(f"Unsupported band workflow child stage: {stage}")
 
-        input_path.write_text(rendered, encoding="utf-8")
+        rendered = write_workflow_input(input_path, rendered, manifest)
         append_log(child_log_path, f"Wrote {task_id} {stage} input: {input_path}\n")
 
         command = build_qe_command(engine, input_path.name, output_path.name)
@@ -8534,6 +8750,27 @@ def band_child_output_path(workflow_root: Path, task: Mapping[str, Any], *, stag
     return None
 
 
+def band_child_input_path(
+    workflow_root: Path,
+    task: Mapping[str, Any],
+    *,
+    stage: str,
+) -> Path | None:
+    stage_key = str(stage or "").strip().lower()
+    for child in task.get("children") or []:
+        if not isinstance(child, Mapping):
+            continue
+        child_stage = str(
+            (child.get("params") or {}).get("stage") or child.get("id") or ""
+        ).strip().lower()
+        if child_stage != stage_key:
+            continue
+        relative_input = str(child.get("input") or "").strip()
+        if relative_input:
+            return workflow_root / relative_input
+    return None
+
+
 def band_child_by_stage(task: Mapping[str, Any], *, stage: str) -> Mapping[str, Any] | None:
     stage_key = str(stage or "").strip().lower()
     for child in task.get("children") or []:
@@ -8866,6 +9103,7 @@ def run_accuracy_relaxation_task(
         )
         attempt = run_relaxation_attempt(
             rendered,
+            manifest=manifest,
             input_path=input_path,
             output_path=output_path,
             child_workdir=child_workdir,
@@ -8905,6 +9143,7 @@ def run_accuracy_relaxation_task(
             )
             attempt = run_relaxation_attempt(
                 retry_rendered,
+                manifest=manifest,
                 input_path=input_path,
                 output_path=output_path,
                 child_workdir=child_workdir,
@@ -8939,6 +9178,7 @@ def run_accuracy_relaxation_task(
                     convergence_summary,
                     attempts,
                     error_message,
+                    manifest,
                 )
             else:
                 failed_structure_relative = str(Path("data_and_plots") / structure_filename)
@@ -9001,6 +9241,7 @@ def run_accuracy_relaxation_task(
                 template_text,
                 relaxed_structure,
                 workflow_root / structure_template_relative,
+                manifest=manifest,
             )
             append_log(
                 child_log_path,
@@ -9070,6 +9311,7 @@ def run_accuracy_relaxation_task(
 def run_relaxation_attempt(
     rendered_input: str,
     *,
+    manifest: Mapping[str, Any],
     input_path: Path,
     output_path: Path,
     child_workdir: Path,
@@ -9077,7 +9319,7 @@ def run_relaxation_attempt(
     task_id: str,
     attempt_number: int,
 ) -> dict[str, Any]:
-    input_path.write_text(rendered_input, encoding="utf-8")
+    rendered_input = write_workflow_input(input_path, rendered_input, manifest)
     append_log(child_log_path, f"Wrote {task_id} attempt {attempt_number} input: {input_path}\n")
 
     command = build_pw_command(input_path.name, output_path.name)
@@ -9169,6 +9411,7 @@ def record_structure_relaxation_failure(
     convergence_summary: Mapping[str, Any],
     attempts: list[dict[str, Any]],
     error_message: str,
+    manifest: Mapping[str, Any],
 ) -> None:
     failed_structure_relative = str(Path("data_and_plots") / "final_relaxation_failed_structure.json")
     write_json_file(workflow_root / failed_structure_relative, relaxed_structure)
@@ -9179,6 +9422,7 @@ def record_structure_relaxation_failure(
             prepared_template.read_text(encoding="utf-8", errors="ignore"),
             relaxed_structure,
             workflow_root / failed_template_relative,
+            manifest=manifest,
         )
     archive_terminal_relaxation_attempt(workflow_root, child)
 
@@ -9226,10 +9470,16 @@ def structure_template_path_for_task(task_id: str, *, success: bool) -> str:
     return str(Path("source") / name)
 
 
-def write_structure_template(template_text: str, structure_data: Mapping[str, Any], output_path: Path) -> None:
+def write_structure_template(
+    template_text: str,
+    structure_data: Mapping[str, Any],
+    output_path: Path,
+    *,
+    manifest: Mapping[str, Any],
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rendered = render_qe_input_with_structure(template_text, structure_data)
-    output_path.write_text(rendered, encoding="utf-8")
+    write_workflow_input(output_path, rendered, manifest)
 
 
 def write_relaxed_structure_cif(structure_data: Mapping[str, Any], cif_path: Path) -> None:
@@ -9454,7 +9704,7 @@ def run_cutoff_child(
             child_workdir=child.get("workdir") or "",
             child_id=str(child.get("id") or f"ecut{ecutwfc}"),
         )
-        input_path.write_text(rendered, encoding="utf-8")
+        rendered = write_workflow_input(input_path, rendered, manifest)
         append_log(child_log_path, f"Wrote cutoff convergence input: {input_path}\n")
 
         command = build_pw_command(input_path.name, output_path.name)
@@ -9646,6 +9896,33 @@ def workflow_spin_orbit_enabled(manifest: Mapping[str, Any]) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def workflow_convert_2d_structure_enabled(manifest: Mapping[str, Any]) -> bool:
+    conversion = (
+        manifest.get("conversion")
+        if isinstance(manifest.get("conversion"), Mapping)
+        else {}
+    )
+    value = conversion.get("convert_2d_structure") if isinstance(conversion, Mapping) else None
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def write_workflow_input(
+    path: Path,
+    text: str,
+    manifest: Mapping[str, Any],
+) -> str:
+    """Write a generated input after enforcing workflow-wide invariants."""
+
+    finalized = force_2d_k_points_automatic(
+        text,
+        enabled=workflow_convert_2d_structure_enabled(manifest),
+    )
+    path.write_text(finalized, encoding="utf-8")
+    return finalized
 
 
 def evaluate_cutoff_convergence(task: Mapping[str, Any]) -> dict[str, Any]:
@@ -10236,7 +10513,7 @@ def run_kpoint_child(
             child_id=str(child.get("id") or "kmesh"),
             ecutwfc=ecutwfc,
         )
-        input_path.write_text(rendered, encoding="utf-8")
+        rendered = write_workflow_input(input_path, rendered, manifest)
         append_log(child_log_path, f"Wrote k-point convergence input: {input_path}\n")
 
         command = build_pw_command(input_path.name, output_path.name)
@@ -10545,6 +10822,14 @@ def optional_positive_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return number if number > 0 else None
+
+
+def optional_nonnegative_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
 
 
 def relaxation_parameters_for_child(
