@@ -1404,16 +1404,22 @@ def render_charge_density_pp_input(
     *,
     prefix: str,
     outdir: str = "./out/",
-    fileout: str = "{prefix}_rho.cube",
+    fileout: str = "{prefix}.cube",
+    plot_num: int = 8,
     nx: int = 64,
     ny: int = 64,
     nz: int = 64,
 ) -> str:
-    """Render pp.x input for charge-density cube export."""
+    """Render pp.x input for the post-processing workflow."""
 
     safe_prefix = str(prefix or "charge_density").strip() or "charge_density"
-    resolved_fileout = str(fileout or "{prefix}_rho.cube").strip() or "{prefix}_rho.cube"
+    resolved_fileout = str(fileout or "{prefix}.cube").strip() or "{prefix}.cube"
     resolved_fileout = resolved_fileout.replace("{prefix}", safe_prefix)
+    try:
+        plot_num_value = int(plot_num)
+    except (TypeError, ValueError):
+        plot_num_value = 8
+    plot_num_value = min(25, max(0, plot_num_value))
     nx_value = max(1, int(nx or 64))
     ny_value = max(1, int(ny or 64))
     nz_value = max(1, int(nz or 64))
@@ -1421,7 +1427,7 @@ def render_charge_density_pp_input(
         "&INPUTPP",
         f"     prefix={qe_quote(safe_prefix)},",
         f"     outdir={qe_quote(outdir or './out/')},",
-        "     plot_num=8,",
+        f"     plot_num={plot_num_value},",
         "/",
         "&PLOT",
         "iflag=3,",
@@ -1721,6 +1727,7 @@ def render_q2r_input(
     zasr: str = "crystal",
     la2f: bool = False,
     lshift_q: bool = False,
+    loto_2d: bool = False,
 ) -> str:
     """Render the q2r.x force-constants input for a phonon dispersion workflow."""
 
@@ -1733,6 +1740,8 @@ def render_q2r_input(
         entries.append(("la2F", ".true."))
     if lshift_q:
         entries.append(("lshift_q", ".true."))
+    if loto_2d:
+        entries.append(("loto_2d", ".true."))
     width = max(len(key) for key, _value in entries)
     lines = ["&input"]
     for key, value in entries:
@@ -1751,6 +1760,7 @@ def render_matdyn_input(
     asr: str = "crystal",
     q_in_band_form: bool = True,
     la2f: bool = False,
+    loto_2d: bool = False,
 ) -> str:
     """Render the matdyn.x phonon-dispersion input."""
 
@@ -1764,6 +1774,8 @@ def render_matdyn_input(
         entries.append(("flvec", qe_quote(flvec)))
     if la2f:
         entries.append(("la2F", ".true."))
+    if loto_2d:
+        entries.append(("loto_2d", ".true."))
     width = max(len(key) for key, _value in entries)
     lines = ["&input"]
     for key, value in entries:
@@ -1785,6 +1797,7 @@ def render_phonon_dos_input(
     flfrq: str = "phonon.freq.dos",
     ndos: int | None = None,
     la2f: bool = False,
+    loto_2d: bool = False,
 ) -> str:
     """Render the matdyn.x phonon DOS input."""
 
@@ -1806,6 +1819,8 @@ def render_phonon_dos_input(
         entries.append(("ndos", str(max(1, int(ndos)))))
     if la2f:
         entries.append(("la2F", ".true."))
+    if loto_2d:
+        entries.append(("loto_2d", ".true."))
     width = max(len(key) for key, _value in entries)
     lines = ["&input"]
     for key, value in entries:
@@ -2976,7 +2991,12 @@ def build_workflow_manifest(request: WorkflowBuildRequest) -> dict[str, Any]:
     fermi_surface_options = normalize_fermi_surface_options(request.fermi_surface_options)
     charge_density_options = normalize_charge_density_options(request.charge_density_options)
     elastic_options = normalize_elastic_options(request.elastic_options)
-    phonon_options = normalize_phonon_options(request.phonon_options)
+    phonon_options = normalize_phonon_options(
+        request.phonon_options,
+        convert_2d_structure=_truthy_option(
+            conversion_options.get("convert_2d_structure")
+        ),
+    )
 
     tasks = build_manifest_tasks(
         selected_workflows=selected,
@@ -3456,7 +3476,7 @@ def build_manifest_tasks(
             {
                 "id": "charge_density_workflow",
                 "type": "qe.charge_density_workflow",
-                "label": "Charge density workflow",
+                "label": "Post processing workflow",
                 "depends_on": [dependency],
                 "params": {
                     "template_source": str(Path(SOURCE_DIR) / PREPARED_QE_TEMPLATE_NAME),
@@ -3666,6 +3686,8 @@ def normalize_selected_workflows(selected_workflows: Sequence[str]) -> list[str]
         "charge": "charge_density",
         "chargedensity": "charge_density",
         "charge_densities": "charge_density",
+        "post_processing": "charge_density",
+        "postprocessing": "charge_density",
         "elastic_properties": "elastic",
         "elastic_property": "elastic",
         "elastic_constants": "elastic",
@@ -3856,14 +3878,16 @@ def normalize_fermi_surface_options(options: Mapping[str, Any]) -> dict[str, Any
 
 
 def normalize_charge_density_options(options: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize charge-density workflow settings."""
+    """Normalize post-processing workflow settings."""
 
     raw = dict(options or {})
     kpoint_spacing = positive_float(raw, ["kpoint_spacing", "scf_kpoint_spacing", "kspacing"], 0.10)
     prefix = str(raw.get("prefix") or "").strip()
-    fileout = str(raw.get("fileout") or raw.get("file_out") or "{prefix}_rho.cube").strip()
+    fileout = str(raw.get("fileout") or raw.get("file_out") or "{prefix}.cube").strip()
     if not fileout:
-        fileout = "{prefix}_rho.cube"
+        fileout = "{prefix}.cube"
+    plot_num = optional_int(raw, ["plot_num", "plotnum"])
+    plot_num = 8 if plot_num is None else min(25, max(0, plot_num))
     nx = optional_int(raw, ["nx"])
     ny = optional_int(raw, ["ny"])
     nz = optional_int(raw, ["nz"])
@@ -3871,6 +3895,7 @@ def normalize_charge_density_options(options: Mapping[str, Any]) -> dict[str, An
         "kpoint_spacing": kpoint_spacing,
         "prefix": prefix,
         "fileout": fileout,
+        "plot_num": plot_num,
         "nx": int(nx) if nx and nx > 0 else 64,
         "ny": int(ny) if ny and ny > 0 else 64,
         "nz": int(nz) if nz and nz > 0 else 64,
@@ -3910,7 +3935,11 @@ def normalize_elastic_options(options: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_phonon_options(options: Mapping[str, Any]) -> dict[str, Any]:
+def normalize_phonon_options(
+    options: Mapping[str, Any],
+    *,
+    convert_2d_structure: bool = False,
+) -> dict[str, Any]:
     """Normalize phonon workflow settings."""
 
     raw = dict(options or {})
@@ -3975,6 +4004,11 @@ def normalize_phonon_options(options: Mapping[str, Any]) -> dict[str, Any]:
     q_path = normalize_matdyn_q_path(
         raw.get("matdyn_q_path", raw.get("q_path", raw.get("matdyn_path", matdyn_raw.get("q_path"))))
     )
+    explicit_matdyn_asr = any(
+        value is not None and str(value).strip()
+        for value in (raw.get("matdyn_asr"), matdyn_raw.get("asr"))
+    )
+    default_matdyn_asr = "all" if convert_2d_structure and not explicit_matdyn_asr else "crystal"
 
     return {
         "mode": mode,
@@ -4024,7 +4058,10 @@ def normalize_phonon_options(options: Mapping[str, Any]) -> dict[str, Any]:
         "lambda_degauss_scan_max": min(0.8, positive_float(raw, ["lambda_degauss_scan_max", "max_degauss"], 0.8)),
         "lambda_q_points": normalize_epc_lambda_q_points(raw.get("lambda_q_points", raw.get("epc_lambda_q_points"))),
         "q2r_zasr": str(raw.get("q2r_zasr") or q2r_raw.get("zasr") or "crystal").strip() or "crystal",
-        "matdyn_asr": str(raw.get("matdyn_asr") or matdyn_raw.get("asr") or "crystal").strip() or "crystal",
+        "matdyn_asr": (
+            str(raw.get("matdyn_asr") or matdyn_raw.get("asr") or default_matdyn_asr).strip()
+            or default_matdyn_asr
+        ),
         "matdyn_q_in_band_form": _truthy_option(
             raw.get("matdyn_q_in_band_form", matdyn_raw.get("q_in_band_form", True))
         ),
@@ -4528,7 +4565,7 @@ def build_fermi_surface_child(
 
 
 def build_charge_density_children(task: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Initial child jobs for charge-density cube workflows."""
+    """Initial child jobs for post-processing workflows."""
 
     _ = task
     return [
@@ -4554,7 +4591,7 @@ def build_charge_density_child(
     output_name: str,
     engine: str,
 ) -> dict[str, Any]:
-    """State child for one stage of the charge-density workflow."""
+    """State child for one stage of the post-processing workflow."""
 
     workdir = Path(CHARGE_DENSITY_DIR)
     return {
@@ -4871,8 +4908,10 @@ def workflow_task_metadata(key: str) -> dict[str, str]:
         "dos": {"id": "dos_workflow", "type": "qe.dos_workflow", "label": "Projected density of states workflow"},
         "fermi_surface": {"id": "fermi_surface_workflow", "type": "qe.fermi_surface_workflow", "label": "Fermi surface workflow"},
         "fermisurface": {"id": "fermi_surface_workflow", "type": "qe.fermi_surface_workflow", "label": "Fermi surface workflow"},
-        "charge_density": {"id": "charge_density_workflow", "type": "qe.charge_density_workflow", "label": "Charge density workflow"},
-        "chargedensity": {"id": "charge_density_workflow", "type": "qe.charge_density_workflow", "label": "Charge density workflow"},
+        "charge_density": {"id": "charge_density_workflow", "type": "qe.charge_density_workflow", "label": "Post processing workflow"},
+        "chargedensity": {"id": "charge_density_workflow", "type": "qe.charge_density_workflow", "label": "Post processing workflow"},
+        "post_processing": {"id": "charge_density_workflow", "type": "qe.charge_density_workflow", "label": "Post processing workflow"},
+        "postprocessing": {"id": "charge_density_workflow", "type": "qe.charge_density_workflow", "label": "Post processing workflow"},
         "elastic": {"id": "elastic_workflow", "type": "qe.elastic_workflow", "label": "Elastic properties workflow"},
         "elastic_properties": {"id": "elastic_workflow", "type": "qe.elastic_workflow", "label": "Elastic properties workflow"},
         "elastic_property": {"id": "elastic_workflow", "type": "qe.elastic_workflow", "label": "Elastic properties workflow"},

@@ -853,6 +853,11 @@ def run_phonon_workflow_child(
     output_path = workflow_root / str(child.get("output") or "")
     child_log_path = workflow_root / str(child.get("log") or f"logs/{child.get('id')}.log")
     stage = str((child.get("params") or {}).get("stage") or child.get("id") or "").strip().lower()
+    convert_2d_structure = workflow_convert_2d_structure_enabled(manifest)
+    matdyn_asr = str(
+        phonon_options.get("matdyn_asr")
+        or ("all" if convert_2d_structure else "crystal")
+    )
 
     child_workdir.mkdir(parents=True, exist_ok=True)
     input_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1094,6 +1099,7 @@ def run_phonon_workflow_child(
                 fildyn=str(phonon_options.get("fildyn") or "phonon.dyn"),
                 flfrc=str(phonon_options.get("flfrc") or "phonon.fc"),
                 zasr=str(phonon_options.get("q2r_zasr") or "crystal"),
+                loto_2d=convert_2d_structure,
             )
             engine = "q2r.x"
         elif stage == "epc_q2r":
@@ -1120,8 +1126,9 @@ def run_phonon_workflow_child(
                 flfrq=str(phonon_options.get("flfrq") or "phonon.freq"),
                 flvec=str(phonon_options.get("matdyn_flvec") or "phonon_band.modes"),
                 q_path_lines=phonon_options.get("matdyn_q_path") or [],
-                asr=str(phonon_options.get("matdyn_asr") or "crystal"),
+                asr=matdyn_asr,
                 q_in_band_form=bool(phonon_options.get("matdyn_q_in_band_form", True)),
+                loto_2d=convert_2d_structure,
             )
             engine = "matdyn.x"
         elif stage == "epc_matdyn":
@@ -1131,9 +1138,10 @@ def run_phonon_workflow_child(
                 flfrq=str(phonon_options.get("flfrq") or "phonon.freq"),
                 flvec=str(phonon_options.get("matdyn_flvec") or "phonon_band.modes"),
                 q_path_lines=phonon_options.get("matdyn_q_path") or [],
-                asr=str(phonon_options.get("matdyn_asr") or "crystal"),
+                asr=matdyn_asr,
                 q_in_band_form=bool(phonon_options.get("matdyn_q_in_band_form", True)),
                 la2f=True,
+                loto_2d=convert_2d_structure,
             )
             engine = "matdyn.x"
         elif stage == "tetra_matdyn":
@@ -1155,8 +1163,9 @@ def run_phonon_workflow_child(
                 fldos=str(phonon_options.get("fldos") or "phonon.phdos"),
                 flvec=str(phonon_options.get("phdos_flvec") or "phonon_dos.modes"),
                 nk_grid=phonon_options.get("phdos_nk") or [4, 4, 4],
-                asr=str(phonon_options.get("matdyn_asr") or "crystal"),
+                asr=matdyn_asr,
                 flfrq=str(phonon_options.get("phdos_flfrq") or "phonon.freq.dos"),
+                loto_2d=convert_2d_structure,
             )
             engine = "matdyn.x"
         elif stage == "epc_phdos":
@@ -1166,10 +1175,11 @@ def run_phonon_workflow_child(
                 fldos=str(phonon_options.get("epc_fldos") or "phonon.dos"),
                 flvec=str(phonon_options.get("phdos_flvec") or "phonon_dos.modes"),
                 nk_grid=phonon_options.get("phdos_nk") or [4, 4, 4],
-                asr=str(phonon_options.get("matdyn_asr") or "crystal"),
+                asr=matdyn_asr,
                 flfrq=str(phonon_options.get("phdos_flfrq") or "phonon.freq.dos"),
                 ndos=int(phonon_options.get("epc_ndos") or 50),
                 la2f=True,
+                loto_2d=convert_2d_structure,
             )
             engine = "matdyn.x"
         elif stage == "tetra_phdos":
@@ -5759,8 +5769,13 @@ def run_charge_density_workflow_task(
     kpoint_spacing = positive_float_or_none(charge_options.get("kpoint_spacing")) or 0.10
     prefix = charge_density_workflow_prefix(manifest, charge_options)
     outdir = "./out/"
-    fileout = str(charge_options.get("fileout") or "{prefix}_rho.cube").strip() or "{prefix}_rho.cube"
+    fileout = str(charge_options.get("fileout") or "{prefix}.cube").strip() or "{prefix}.cube"
     fileout = fileout.replace("{prefix}", prefix)
+    try:
+        plot_num = int(charge_options.get("plot_num", 8))
+    except (TypeError, ValueError):
+        plot_num = 8
+    plot_num = min(25, max(0, plot_num))
     nx = optional_positive_int(charge_options.get("nx")) or 64
     ny = optional_positive_int(charge_options.get("ny")) or 64
     nz = optional_positive_int(charge_options.get("nz")) or 64
@@ -5798,6 +5813,7 @@ def run_charge_density_workflow_task(
                 prefix=prefix,
                 outdir=outdir,
                 fileout=fileout,
+                plot_num=plot_num,
                 nx=nx,
                 ny=ny,
                 nz=nz,
@@ -5818,6 +5834,7 @@ def run_charge_density_workflow_task(
             "outdir": outdir,
             "kpoint_spacing": float(kpoint_spacing),
             "fileout": fileout,
+            "plot_num": plot_num,
             "nx": nx,
             "ny": ny,
             "nz": nz,
@@ -5852,6 +5869,7 @@ def run_charge_density_workflow_child(
     prefix: str,
     outdir: str,
     fileout: str,
+    plot_num: int,
     nx: int,
     ny: int,
     nz: int,
@@ -5899,13 +5917,14 @@ def run_charge_density_workflow_child(
                 prefix=prefix,
                 outdir=outdir,
                 fileout=fileout,
+                plot_num=plot_num,
                 nx=nx,
                 ny=ny,
                 nz=nz,
             )
             engine = "pp.x"
         else:
-            raise RuntimeError(f"Unsupported charge-density workflow child stage: {stage}")
+            raise RuntimeError(f"Unsupported post-processing workflow child stage: {stage}")
 
         rendered = write_workflow_input(input_path, rendered, manifest)
         append_log(child_log_path, f"Wrote {task_id} {stage} input: {input_path}\n")
@@ -5970,13 +5989,13 @@ def collect_charge_density_cube(
     candidates.extend(sorted(child_workdir.glob("*.cube")))
     source = next((path for path in candidates if path.is_file()), None)
     if source is None:
-        raise FileNotFoundError(f"pp.x did not create the requested charge-density cube file: {fileout}")
+        raise FileNotFoundError(f"pp.x did not create the requested post-processing cube file: {fileout}")
 
     target = workflow_root / DATA_PLOTS_DIR / source.name
     target.parent.mkdir(parents=True, exist_ok=True)
     if source.resolve() != target.resolve():
         shutil.copy2(source, target)
-    append_log(log_path, f"Collected charge-density cube file: {target}\n")
+    append_log(log_path, f"Collected post-processing cube file: {target}\n")
     return target
 
 

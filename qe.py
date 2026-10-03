@@ -6715,7 +6715,7 @@ class MainUI(QMainWindow):
             ("bands", "Band structure"),
             ("pdos", "Projected density of states (PDOS)"),
             ("fermi_surface", "Fermi surface"),
-            ("charge_density", "Charge density"),
+            ("charge_density", "Post processing"),
             ("elastic", "Elastic properties"),
             ("phonon", "Phonon"),
             ("wannier", "Wannier90 + SCDM"),
@@ -6829,7 +6829,7 @@ class MainUI(QMainWindow):
             "bands": "Band",
             "pdos": "PDOS",
             "fermi_surface": "Fermi Surface",
-            "charge_density": "Charge Density",
+            "charge_density": "Post processing",
             "elastic": "Elastic",
             "phonon": "Phonon",
             "wannier": "Wannier90 + SCDM",
@@ -7614,6 +7614,12 @@ class MainUI(QMainWindow):
 
         pp_group = QGroupBox("pp.x output", panel)
         pp_form = QFormLayout(pp_group)
+        self.workflowChargeDensityPlotNumSpin = QSpinBox(pp_group)
+        self.workflowChargeDensityPlotNumSpin.setRange(0, 25)
+        self.workflowChargeDensityPlotNumSpin.setValue(8)
+        self.workflowChargeDensityPlotNumSpin.setToolTip(
+            "Quantity selected by pp.x (plot_num, from 0 through 25)."
+        )
         self._workflowChargeDensityFileoutDirty = False
         self.workflowChargeDensityFileoutLineEdit = QLineEdit(self._workflow_charge_density_default_fileout(), pp_group)
         self.workflowChargeDensityFileoutLineEdit.setToolTip(
@@ -7637,6 +7643,7 @@ class MainUI(QMainWindow):
             spin.setMaximumWidth(120)
             grid_layout.addWidget(spin)
         grid_layout.addStretch()
+        pp_form.addRow("plot_num:", self.workflowChargeDensityPlotNumSpin)
         pp_form.addRow("fileout:", self.workflowChargeDensityFileoutLineEdit)
         pp_form.addRow("Grid:", grid_row)
         layout.addWidget(pp_group)
@@ -7807,6 +7814,11 @@ class MainUI(QMainWindow):
             combo.addItem("one-dim", "one-dim")
             combo.addItem("zero-dim", "zero-dim")
             combo.addItem("no", "no")
+        self.workflowPhononMatdynAsrCombo.addItem("all", "all")
+        self._workflowPhononMatdynAsrExplicit = False
+        self.workflowPhononMatdynAsrCombo.activated.connect(
+            lambda _index: setattr(self, "_workflowPhononMatdynAsrExplicit", True),
+        )
         self.workflowPhononBandCheckBox = QCheckBox("Compute phonon band structure", interpolation_group)
         self.workflowPhononBandCheckBox.setChecked(True)
         self.workflowPhononMatdynQInBandFormCheckBox = QCheckBox(
@@ -9296,7 +9308,7 @@ class MainUI(QMainWindow):
         return sanitize_job_name(stem or "charge_density").replace("-", "_").replace(".", "_")
 
     def _workflow_charge_density_default_fileout(self) -> str:
-        return f"{self._workflow_charge_density_default_prefix()}_rho.cube"
+        return f"{self._workflow_charge_density_default_prefix()}.cube"
 
     def _workflow_update_charge_density_fileout(self) -> None:
         if not hasattr(self, "workflowChargeDensityFileoutLineEdit"):
@@ -9552,6 +9564,9 @@ class MainUI(QMainWindow):
         self.workflowConvert2DStructureCheckBox.setChecked(False)
         self.workflowConvert2DStructureCheckBox.setToolTip(
             "Add assume_isolated = '2D' and vdw_corr = 'Grimme-D3' to &SYSTEM."
+        )
+        self.workflowConvert2DStructureCheckBox.toggled.connect(
+            self._workflow_update_phonon_matdyn_asr_default,
         )
         basic_layout.addWidget(QLabel("2D structure:", basic_group), 5, 0)
         basic_layout.addWidget(self.workflowConvert2DStructureCheckBox, 5, 1)
@@ -10573,6 +10588,8 @@ class MainUI(QMainWindow):
             "pdos": "pdos",
             "fermi_surface": "fermi_surface",
             "charge_density": "charge_density",
+            "post_processing": "charge_density",
+            "postprocessing": "charge_density",
             "elastic": "elastic",
             "phonon": "phonon",
             "wannier90": "wannier",
@@ -10631,6 +10648,7 @@ class MainUI(QMainWindow):
             checkbox.setChecked(key in selected)
 
         conversion_recipe = recipe.get("conversion") if isinstance(recipe.get("conversion"), Mapping) else {}
+        self._workflowPhononMatdynAsrExplicit = False
         self._workflow_apply_conversion_options(conversion_recipe)
         self._workflow_apply_relaxation_options(
             recipe.get("relaxation_parameters")
@@ -10832,12 +10850,29 @@ class MainUI(QMainWindow):
 
     def _workflow_apply_charge_density_options(self, options: Mapping[str, Any]) -> None:
         self._workflow_set_double_spinbox_value(self.workflowChargeDensityKpointSpacingSpin, options.get("kpoint_spacing", self.workflowChargeDensityKpointSpacingSpin.value()))
+        self._workflow_set_spinbox_value(self.workflowChargeDensityPlotNumSpin, options.get("plot_num", 8))
         if options.get("fileout") is not None:
             self.workflowChargeDensityFileoutLineEdit.setText(str(options.get("fileout")))
             self._workflowChargeDensityFileoutDirty = True
         self._workflow_set_spinbox_value(self.workflowChargeDensityNxSpin, options.get("nx", self.workflowChargeDensityNxSpin.value()))
         self._workflow_set_spinbox_value(self.workflowChargeDensityNySpin, options.get("ny", self.workflowChargeDensityNySpin.value()))
         self._workflow_set_spinbox_value(self.workflowChargeDensityNzSpin, options.get("nz", self.workflowChargeDensityNzSpin.value()))
+
+    def _workflow_update_phonon_matdyn_asr_default(self, checked: Any = None) -> None:
+        if not hasattr(self, "workflowPhononMatdynAsrCombo"):
+            return
+        if bool(getattr(self, "_workflowPhononMatdynAsrExplicit", False)):
+            return
+        if checked is None:
+            checked = bool(
+                self.workflowConvert2DStructureCheckBox.isChecked()
+                if hasattr(self, "workflowConvert2DStructureCheckBox")
+                else False
+            )
+        self._workflow_set_combo_data(
+            self.workflowPhononMatdynAsrCombo,
+            "all" if bool(checked) else "crystal",
+        )
 
     def _workflow_apply_elastic_options(self, options: Mapping[str, Any]) -> None:
         self._workflow_set_combo_data(self.workflowElasticWhatCombo, options.get("what") or "scf_elastic_constants")
@@ -10870,7 +10905,22 @@ class MainUI(QMainWindow):
         self.workflowPhononFlfrqLineEdit.setText(str(options.get("flfrq") or "phonon.freq.band"))
         self.workflowPhononMatdynFlvecLineEdit.setText(str(options.get("matdyn_flvec") or "phonon_band.modes"))
         self._workflow_set_combo_data(self.workflowPhononQ2rZasrCombo, options.get("q2r_zasr") or "crystal")
-        self._workflow_set_combo_data(self.workflowPhononMatdynAsrCombo, options.get("matdyn_asr") or "crystal")
+        matdyn_options = options.get("matdyn") if isinstance(options.get("matdyn"), Mapping) else {}
+        raw_matdyn_asr = options.get("matdyn_asr")
+        if raw_matdyn_asr is None:
+            raw_matdyn_asr = matdyn_options.get("asr")
+        explicit_matdyn_asr = raw_matdyn_asr is not None and bool(str(raw_matdyn_asr).strip())
+        default_matdyn_asr = (
+            "all"
+            if hasattr(self, "workflowConvert2DStructureCheckBox")
+            and self.workflowConvert2DStructureCheckBox.isChecked()
+            else "crystal"
+        )
+        self._workflow_set_combo_data(
+            self.workflowPhononMatdynAsrCombo,
+            raw_matdyn_asr if explicit_matdyn_asr else default_matdyn_asr,
+        )
+        self._workflowPhononMatdynAsrExplicit = explicit_matdyn_asr
         self.workflowPhononBandCheckBox.setChecked(bool(options.get("band_enabled", True)))
         self.workflowPhononMatdynQInBandFormCheckBox.setChecked(bool(options.get("matdyn_q_in_band_form", True)))
         self.workflowPhononDosCheckBox.setChecked(bool(options.get("dos_enabled", True)))
@@ -11228,6 +11278,7 @@ class MainUI(QMainWindow):
             fileout = fileout.replace("{prefix}", self._workflow_charge_density_default_prefix())
         return {
             "kpoint_spacing": float(self.workflowChargeDensityKpointSpacingSpin.value()),
+            "plot_num": int(self.workflowChargeDensityPlotNumSpin.value()),
             "fileout": fileout,
             "nx": int(self.workflowChargeDensityNxSpin.value()),
             "ny": int(self.workflowChargeDensityNySpin.value()),
@@ -11630,7 +11681,12 @@ class MainUI(QMainWindow):
             metadata=metadata,
         )
         relaxation = relaxation_mode.replace("_", " ")
-        workflow_labels = ", ".join(selected_workflows) if selected_workflows else "relaxation"
+        workflow_label_names = {"charge_density": "Post processing"}
+        workflow_labels = (
+            ", ".join(workflow_label_names.get(key, key) for key in selected_workflows)
+            if selected_workflows
+            else "relaxation"
+        )
         notices = workflow_files.manifest.get("notices") if isinstance(workflow_files.manifest.get("notices"), list) else []
         notice_text = f" {notices[0]}" if notices else ""
         self.workflowSubmitStatusLabel.setText(
@@ -12585,7 +12641,7 @@ class MainUI(QMainWindow):
             )
             charge_density_key = f"{root_key}:group:charge_density"
             charge_density_group = self._workflow_tree_item(
-                "Charge density workflow",
+                "Post processing workflow",
                 charge_density_status,
                 {
                     "kind": "group",
@@ -12955,7 +13011,7 @@ class MainUI(QMainWindow):
             stage = str((child.get("params") or {}).get("stage") or child_id).lower()
             stage_labels = {
                 "scf": "SCF calculation",
-                "pp": "pp.x charge density",
+                "pp": "pp.x post processing",
             }
             if stage in stage_labels:
                 return stage_labels[stage]
@@ -13170,7 +13226,7 @@ class MainUI(QMainWindow):
         if normalized == "fermi_surface_workflow":
             return "Fermi surface workflow"
         if normalized == "charge_density_workflow":
-            return "Charge density workflow"
+            return "Post processing workflow"
         if normalized == "elastic_workflow":
             return "Elastic properties workflow"
         if normalized == "phonon_workflow":
